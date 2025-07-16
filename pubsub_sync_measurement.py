@@ -31,6 +31,7 @@ class PubSubSyncNode:
         self.context = zmq.Context()
         self.measurements = []
         self.pending_messages = {}
+        self.control_port = 5557  # Control channel port
         
     def timestamp_us(self):
         return int(time.time() * 1_000_000)
@@ -51,6 +52,10 @@ class PubSubSyncNode:
             json.dump({'node_id': self.node_id, 'measurements': data, 'count': len(data)}, f, indent=2)
     
     def run_server(self, rate_hz=10, duration_sec=60, message_sizes=[1024, 1048576, 10485760]):
+        # Setup control channel
+        control_socket = self.context.socket(zmq.REP)
+        control_socket.bind(f"tcp://*:{self.control_port}")
+        
         pub_socket = self.context.socket(zmq.PUB)
         pub_socket.bind(f"tcp://*:{self.server_pub_port}")
         
@@ -61,7 +66,13 @@ class PubSubSyncNode:
         print(f"Server: {rate_hz}Hz, {duration_sec}s, sizes={message_sizes}")
         
         threading.Thread(target=self._server_response_listener, args=(sub_socket,), daemon=True).start()
-        time.sleep(1)
+        
+        # Wait for client ready signal
+        print("Server: waiting for client ready...")
+        control_socket.recv_string()
+        control_socket.send_string("ready")
+        control_socket.close()
+        print("Server: client ready, starting test...")
         
         total_messages = int(rate_hz * duration_sec)
         print(f"Generating {total_messages} messages")
@@ -131,7 +142,15 @@ class PubSubSyncNode:
         pub_socket.bind(f"tcp://*:{self.client_pub_port}")
         
         print(f"Client: subscribing to {self.server_pub_port}, publishing on {self.client_pub_port}")
-        time.sleep(1)
+        time.sleep(1)  # Allow pub-sub connections to establish
+        
+        # Signal server that client is ready
+        control_socket = self.context.socket(zmq.REQ)
+        control_socket.connect(f"tcp://{self.server_ip}:{self.control_port}")
+        control_socket.send_string("ready")
+        control_socket.recv_string()
+        control_socket.close()
+        print("Client: ready signal sent, waiting for messages...")
         
         start_time = time.time()
         received_count = 0
@@ -172,7 +191,7 @@ def run_test(rate_hz, duration_sec, message_sizes, server_pub_port=5555, client_
     client_node = PubSubSyncNode("client", server_pub_port, client_pub_port)
     
     threading.Thread(target=client_node.run_client, args=(duration_sec + 10,), daemon=True).start()
-    time.sleep(2)
+    time.sleep(1)  # Reduced since control channel handles sync
     server_node.run_server(rate_hz, duration_sec, message_sizes)
     
     if server_node.measurements:
