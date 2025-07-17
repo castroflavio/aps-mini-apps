@@ -67,19 +67,13 @@ class PubSubProducer:
         print(f"TX PPS - Avg: {np.mean(tx_pps):.0f}, P50: {np.percentile(tx_pps, 50):.0f}, P99: {np.percentile(tx_pps, 99):.0f}")
     
     def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0'):
+        # Setup control and data sockets
         control_socket = self.context.socket(zmq.REP)
         control_socket.bind(f"tcp://*:{self.control_port}")
-        
         pub_socket = self.context.socket(zmq.PUB)
         pub_socket.bind(f"tcp://*:{self.data_port}")
         
-        viz_socket = self.context.socket(zmq.SUB)
-        viz_socket.connect(f"tcp://{self.viz_ip}:{self.viz_port}")
-        viz_socket.setsockopt(zmq.SUBSCRIBE, b"response")
-        
         print(f"Producer: {rate_hz}Hz, {duration_sec}s, msg_size={msg_size}")
-        
-        threading.Thread(target=self._vizualization_listener, args=(viz_socket,), daemon=True).start()
         
         # Start network monitoring
         network_csv = f"network_{interface}_{int(time.time())}.csv"
@@ -97,11 +91,16 @@ class PubSubProducer:
         control_socket.close()
         print("Producer: consumer start, starting test...")
         
+        # Setup visualization socket after control message
+        viz_socket = self.context.socket(zmq.SUB)
+        viz_socket.connect(f"tcp://{self.viz_ip}:{self.viz_port}")
+        viz_socket.setsockopt(zmq.SUBSCRIBE, b"response")
+        threading.Thread(target=self._vizualization_listener, args=(viz_socket,), daemon=True).start()
+        
+        # Main streaming loop
         total_messages = int(rate_hz * duration_sec)
         print(f"Generating {total_messages} messages")
-        
         self.streaming_started = True
-        
         start_time = time.time()
         seq_n = 0
         
@@ -111,11 +110,10 @@ class PubSubProducer:
             message = {
                 'type': 'request', 'seq_n': seq_n, 'msg_id': msg_id, 't1': t1,
                 'msg_size': msg_size, 'data': 'x' * msg_size
-            } ## How much time does data generation take
+            }
             
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
             pub_socket.send_multipart([b"request", json.dumps(message).encode()])
-            ## how much time does data serialization take
             
             if seq_n % 100 == 0:
                 print(f"Producer: published seq={seq_n}, size={msg_size}B")
