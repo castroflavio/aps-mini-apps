@@ -55,7 +55,7 @@ class PubSubConsumer:
                     
                     response = {
                         'type': 'response', 'msg_id': request['msg_id'], 'seq_n': request['seq_n'],
-                        't2': t2, 't3': t3, 'original_size': request['message_size'], 'status': 'processed'
+                        't2': t2, 't3': t3, 'original_size': request['msg_size'], 'status': 'processed'
                     }
                     
                     pub_socket.send_multipart([b"response", json.dumps(response).encode()])
