@@ -74,7 +74,7 @@ class PubSubConsumer:
 
 @click.command()
 @click.option('-t', default=60, help='Duration seconds')
-@click.option('--viz-ip', default='localhost', help='Visualization IP address')
+@click.option('--producer-ip', default='localhost', help='Visualization IP address')
 @click.option('--producer-data-port', default=5555, help='Server publisher port')
 @click.option('--client-pub-port', default=5556, help='Client publisher port')
 @click.option('--control-port', default=5557, help='Control channel port')
