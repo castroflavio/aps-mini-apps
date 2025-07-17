@@ -64,6 +64,8 @@ class PubSubConsumer:
                     if received_count % 100 == 0:
                         print(f"Consumer: processed {received_count}")
                 
+            except zmq.Again:
+                time.sleep(0.001)
             except Exception as e:
                 print(f"Consumer error: {e}")
                 break

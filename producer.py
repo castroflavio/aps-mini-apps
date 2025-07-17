@@ -151,6 +151,8 @@ class PubSubProducer:
                     if len(self.measurements) % 100 == 0:
                         print(f"Producer: {len(self.measurements)} processed messages, "
                               f"offset={measurement['clock_offset_ms']}ms")
+            except zmq.Again:
+                time.sleep(0.001)
             except Exception as e:
                 print(f"Producer error: {e}")
                 break
