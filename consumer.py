@@ -76,7 +76,7 @@ class PubSubConsumer:
 @click.option('-t', default=60, help='Duration seconds')
 @click.option('--producer-ip', default='localhost', help='Visualization IP address')
 @click.option('--producer-data-port', default=5555, help='Server publisher port')
-@click.option('--client-pub-port', default=5556, help='Client publisher port')
+@click.option('--viz-port', default=5556, help='Client publisher port')
 @click.option('--control-port', default=5557, help='Control channel port')
 @click.option('--processing-time-ms', default=0.4, help='Processing time in milliseconds')
 def main(t, producer_ip, producer_data_port, viz_port, control_port, processing_time_ms):
