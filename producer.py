@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 1.1
+Version 1.2
 """
 
 import time
@@ -108,18 +108,21 @@ class PubSubProducer:
         interval = 1.0 / rate_hz
         next_send_time = time.time()
         
+        # Pre-encode static parts for optimization
+        data_payload = 'x' * msg_size
+        
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
-            msg_id = str(uuid.uuid4())
+            msg_id = f"{seq_n}"
             t1 = self.timestamp_us()
             message = {
                 'type': 'request', 'seq_n': seq_n, 'msg_id': msg_id, 't1': t1,
-                'msg_size': msg_size, 'data': 'x' * msg_size
+                'msg_size': msg_size, 'data': data_payload
             }
             
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
             pub_socket.send_multipart([b"request", json.dumps(message).encode()])
             
-            if seq_n % 100 == 0:
+            if seq_n % rate_hz == 0:
                 print(f"Producer: published seq={seq_n}, size={msg_size}B")
             seq_n += 1
             
