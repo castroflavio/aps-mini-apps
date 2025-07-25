@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 1.0
+Version 1.1
 """
 
 import time
@@ -104,6 +104,10 @@ class PubSubProducer:
         start_time = time.time()
         seq_n = 0
         
+        # Compensating sleep strategy for precise timing
+        interval = 1.0 / rate_hz
+        next_send_time = time.time()
+        
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
             msg_id = str(uuid.uuid4())
             t1 = self.timestamp_us()
@@ -118,7 +122,16 @@ class PubSubProducer:
             if seq_n % 100 == 0:
                 print(f"Producer: published seq={seq_n}, size={msg_size}B")
             seq_n += 1
-            time.sleep(1.0 / rate_hz)
+            
+            # Compensating sleep for precise rate control
+            next_send_time += interval
+            sleep_time = next_send_time - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # Can't keep up with target rate!
+                if seq_n % 100 == 0:
+                    print(f"WARNING: {-sleep_time*1000:.1f}ms behind schedule")
         
         print(f"Producer: published {seq_n} messages in {time.time() - start_time:.1f}s")
         time.sleep(5) # Analysis timeout time at the producer
