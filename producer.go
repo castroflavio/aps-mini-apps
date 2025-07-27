@@ -227,7 +227,7 @@ func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages 
 		p.mu.Unlock()
 		
 		// Send message (non-blocking)
-		err := pubSocket.SendMessage("request", message)
+		_, err := pubSocket.SendMessage("request", message)
 		if err != nil {
 			skipped++
 			p.mu.Lock()
