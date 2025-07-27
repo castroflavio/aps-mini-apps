@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.1
+Version 2.3
 """
 
 import time
@@ -75,6 +75,7 @@ class PubSubProducer:
         control_socket = self.context.socket(zmq.REP)
         control_socket.bind(f"tcp://*:{self.control_port}")
         pub_socket = self.context.socket(zmq.PUB)
+        pub_socket.set_hwm(1000)  # Prevent memory explosion at high rates
         pub_socket.bind(f"tcp://*:{self.data_port}")
         
         network_csv = f"network_{interface}_{int(time.time())}.csv"
@@ -116,12 +117,21 @@ class PubSubProducer:
             except zmq.Again:
                 skipped += 1
                 self.pending_messages.pop(msg_id)
+                # Critical: ZMQ queue full at high rates indicates consumer can't keep up
+                if seq_n % 10 == 0:  # More frequent warnings for queue issues
+                    print(f"ZMQ queue full! Skipped {skipped} messages, consumer falling behind")
             seq_n += 1
             
             next_send_time += interval
             sleep_time = next_send_time - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            else:
+                # Critical: warn if falling behind at high rates
+                if seq_n % 100 == 0:  # Every 100 messages
+                    behind_ms = -sleep_time * 1000
+                    actual_rate = seq_n / (time.time() - start_time)
+                    print(f"WARNING: {behind_ms:.1f}ms behind, actual rate: {actual_rate:.1f}Hz (target: {rate_hz}Hz)")
         
         time.sleep(5)
         pub_socket.close()
