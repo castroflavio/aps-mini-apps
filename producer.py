@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.4
+Version 2.5
 """
 
 import time
@@ -100,27 +100,40 @@ class PubSubProducer:
         next_send_time = time.time()
         prepared_messages = self._prepare_messages(total_messages, msg_size, rate_hz, use_cache)
         skipped = 0
+        sent_count = 0
+        
+        # Bottleneck timing instrumentation
+        time_timestamp = 0
+        time_message_prep = 0
+        time_zmq_send = 0
         
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
             message_data, msg_id, timestamp_offset = prepared_messages[seq_n]
+            
+            # Time timestamp generation
+            t_start = time.perf_counter()
             t1 = self.timestamp_us()
-            
-            # Use fastest timestamp serialization (168ns vs 404ns for fixed-width)
             timestamp_bytes = str(t1).encode().ljust(20, b'0')[:20]
+            time_timestamp += time.perf_counter() - t_start
             
-            # Use string concatenation (348ns) - faster than bytearray ops (404ns)
+            # Time message preparation
+            t_start = time.perf_counter()
             final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
-            
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
+            time_message_prep += time.perf_counter() - t_start
             
+            # Time ZMQ send
+            t_start = time.perf_counter()
             try:
                 pub_socket.send_multipart([b"request", final_message], flags=zmq.NOBLOCK, copy=False)
+                sent_count += 1  # Count actual successful sends
             except zmq.Again:
                 skipped += 1
                 self.pending_messages.pop(msg_id)
-                # Critical: ZMQ queue full at high rates indicates consumer can't keep up
-                if seq_n % 10 == 0:  # More frequent warnings for queue issues
-                    print(f"ZMQ queue full! Skipped {skipped} messages, consumer falling behind")
+                if seq_n % 10 == 0:
+                    print(f"ZMQ queue full! Skipped {skipped}/{seq_n} messages ({100*skipped/seq_n:.1f}%)")
+            time_zmq_send += time.perf_counter() - t_start
+            
             seq_n += 1
             
             next_send_time += interval
@@ -131,19 +144,35 @@ class PubSubProducer:
                 # Critical: warn if falling behind at high rates
                 if seq_n % 100 == 0:  # Every 100 messages
                     behind_ms = -sleep_time * 1000
-                    actual_rate = seq_n / (time.time() - start_time)
-                    print(f"WARNING: {behind_ms:.1f}ms behind, actual rate: {actual_rate:.1f}Hz (target: {rate_hz}Hz)")
+                    current_attempt_rate = seq_n / (time.time() - start_time)
+                    current_success_rate = sent_count / (time.time() - start_time)
+                    print(f"WARNING: {behind_ms:.1f}ms behind, attempt: {current_attempt_rate:.1f}Hz, success: {current_success_rate:.1f}Hz (target: {rate_hz}Hz)")
         
         elapsed_time = time.time() - start_time
-        actual_rate = seq_n / elapsed_time
-        total_bytes = seq_n * msg_size
-        throughput_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
+        attempt_rate = seq_n / elapsed_time
+        success_rate = sent_count / elapsed_time
+        total_bytes_sent = sent_count * msg_size
+        throughput_gbps = (total_bytes_sent * 8) / (elapsed_time * 1e9)
         
         print(f"\n=== Producer Summary ===")
-        print(f"Messages sent: {seq_n:,} ({skipped:,} skipped)")
+        print(f"Messages attempted: {seq_n:,}")
+        print(f"Messages sent: {sent_count:,} ({skipped:,} skipped = {100*skipped/seq_n:.1f}%)")
         print(f"Duration: {elapsed_time:.1f}s")
-        print(f"Rate: {actual_rate:.1f} Hz (target: {rate_hz} Hz)")
+        print(f"Attempt rate: {attempt_rate:.1f} Hz (target: {rate_hz} Hz)")
+        print(f"Success rate: {success_rate:.1f} Hz")
         print(f"Throughput: {throughput_gbps:.2f} Gbps")
+        
+        # Bottleneck analysis
+        avg_timestamp_us = (time_timestamp / seq_n) * 1e6
+        avg_prep_us = (time_message_prep / seq_n) * 1e6
+        avg_send_us = (time_zmq_send / seq_n) * 1e6
+        total_processing_us = avg_timestamp_us + avg_prep_us + avg_send_us
+        
+        print(f"\n=== Bottleneck Analysis ===")
+        print(f"Avg timestamp: {avg_timestamp_us:.1f}µs ({100*time_timestamp/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
+        print(f"Avg msg prep:  {avg_prep_us:.1f}µs ({100*time_message_prep/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
+        print(f"Avg ZMQ send:  {avg_send_us:.1f}µs ({100*time_zmq_send/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
+        print(f"Total per msg: {total_processing_us:.1f}µs (max rate: {1e6/total_processing_us:.0f} Hz)")
         
         time.sleep(5)
         pub_socket.close()
