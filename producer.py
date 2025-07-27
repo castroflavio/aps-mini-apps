@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.7
+Version 2.8
 """
 
 import time
@@ -110,48 +110,34 @@ class PubSubProducer:
         skipped = 0
         sent_count = 0
         
-        # Bottleneck timing instrumentation (fine-grained)
-        time_timestamp = 0
+        # Simplified instrumentation - focus on message prep bottleneck
         time_string_concat = 0
-        time_dict_update = 0
-        time_zmq_send = 0
         
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
             message_data, msg_id, timestamp_offset = prepared_messages[seq_n]
             
-            # Time timestamp generation
-            t_start = time.perf_counter()
             t1 = self.timestamp_us()
             timestamp_bytes = str(t1).encode().ljust(20, b'0')[:20]
-            time_timestamp += time.perf_counter() - t_start
             
-            # Time message preparation (in-place vs concatenation)
+            # Time only the critical message preparation step
             t_start = time.perf_counter()
             if isinstance(message_data, bytearray):
-                # In-place update for bytearray (fast for large messages)
                 message_data[timestamp_offset:timestamp_offset+20] = timestamp_bytes
-                final_message = bytes(message_data)  # Convert to immutable bytes for ZMQ
+                final_message = bytes(message_data)
             else:
-                # String concatenation for cached numpy arrays (slow for large messages)
                 final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
             time_string_concat += time.perf_counter() - t_start
             
-            # Time dictionary update
-            t_start = time.perf_counter()
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
-            time_dict_update += time.perf_counter() - t_start
             
-            # Time ZMQ send
-            t_start = time.perf_counter()
             try:
                 pub_socket.send_multipart([b"request", final_message], flags=zmq.NOBLOCK, copy=False)
-                sent_count += 1  # Count actual successful sends
+                sent_count += 1
             except zmq.Again:
                 skipped += 1
                 self.pending_messages.pop(msg_id)
-                if seq_n % 100 == 0:  # Less frequent to reduce print overhead
+                if seq_n % 100 == 0:
                     print(f"ZMQ queue full! Skipped {skipped}/{seq_n} messages ({100*skipped/seq_n:.1f}%)")
-            time_zmq_send += time.perf_counter() - t_start
             
             seq_n += 1
             
@@ -161,11 +147,10 @@ class PubSubProducer:
                 time.sleep(sleep_time)
             else:
                 # Critical: warn if falling behind at high rates
-                if seq_n % 1000 == 0:  # Every 1000 messages (reduce overhead)
+                if seq_n % 1000 == 0:
                     behind_ms = -sleep_time * 1000
-                    current_attempt_rate = seq_n / (time.time() - start_time)
                     current_success_rate = sent_count / (time.time() - start_time)
-                    print(f"WARNING: {behind_ms:.1f}ms behind, attempt: {current_attempt_rate:.1f}Hz, success: {current_success_rate:.1f}Hz (target: {rate_hz}Hz)")
+                    print(f"WARNING: {behind_ms:.1f}ms behind schedule, actual rate: {current_success_rate:.1f}Hz (target: {rate_hz}Hz)")
         
         elapsed_time = time.time() - start_time
         attempt_rate = seq_n / elapsed_time
@@ -181,35 +166,25 @@ class PubSubProducer:
         print(f"Success rate: {success_rate:.1f} Hz")
         print(f"Throughput: {throughput_gbps:.2f} Gbps")
         
-        # Fine-grained bottleneck analysis
-        total_time = time_timestamp + time_string_concat + time_dict_update + time_zmq_send
-        avg_timestamp_us = (time_timestamp / seq_n) * 1e6
+        # Simplified analysis - focus on message prep bottleneck
         avg_concat_us = (time_string_concat / seq_n) * 1e6
-        avg_dict_us = (time_dict_update / seq_n) * 1e6
-        avg_send_us = (time_zmq_send / seq_n) * 1e6
-        total_processing_us = avg_timestamp_us + avg_concat_us + avg_dict_us + avg_send_us
+        max_rate_hz = 1e6 / avg_concat_us if avg_concat_us > 0 else float('inf')
+        target_interval_us = 1e6 / rate_hz  # Target time between messages
+        prep_overhead_pct = (avg_concat_us / target_interval_us) * 100
         
-        print(f"\n=== Fine-Grained Bottleneck Analysis ===")
-        print(f"Avg timestamp:    {avg_timestamp_us:.1f}µs ({100*time_timestamp/total_time:.1f}%)")
-        print(f"Avg string concat: {avg_concat_us:.1f}µs ({100*time_string_concat/total_time:.1f}%)")
-        print(f"Avg dict update:   {avg_dict_us:.1f}µs ({100*time_dict_update/total_time:.1f}%)")
-        print(f"Avg ZMQ send:      {avg_send_us:.1f}µs ({100*time_zmq_send/total_time:.1f}%)")
-        print(f"Total per msg:     {total_processing_us:.1f}µs (max rate: {1e6/total_processing_us:.0f} Hz)")
+        print(f"\n=== Message Prep Analysis ===")
+        print(f"Avg msg prep time: {avg_concat_us:.0f}µs {'[in-place]' if any(isinstance(m[0], bytearray) for m in prepared_messages[:1]) else '[concat]'}")
+        print(f"Target interval:   {target_interval_us:.0f}µs ({rate_hz}Hz)")
+        print(f"Prep overhead:     {prep_overhead_pct:.1f}% of target interval")
+        print(f"Max sustainable:   {max_rate_hz:.0f} Hz (based on msg prep alone)")
         
-        # Performance recommendation
-        if msg_size > 1024*1024:  # >1MB messages
-            if any(isinstance(m[0], bytearray) for m in prepared_messages[:1]):
-                print(f"✅ Using in-place updates for {msg_size//1024//1024}MB messages (optimal)")
-            else:
-                print(f"⚠️  Using concatenation for {msg_size//1024//1024}MB messages. Consider avoiding --cache flag for better performance.")
-        
-        # Flag suspicious timings
-        if avg_concat_us > 1000:  # >1ms is suspicious for string concatenation
-            print(f"⚠️  String concatenation is unusually slow ({avg_concat_us:.0f}µs). Check message size or memory allocation.")
-        if avg_dict_us > 500:  # >0.5ms is suspicious for dict update
-            print(f"⚠️  Dictionary updates are slow ({avg_dict_us:.0f}µs). Check pending_messages size: {len(self.pending_messages)}")
-        if avg_send_us > 10000:  # >10ms suggests network issues
-            print(f"⚠️  ZMQ sends are very slow ({avg_send_us:.0f}µs). Check network or consumer performance.")
+        # Simple warnings
+        if prep_overhead_pct > 50:
+            print(f"⚠️  Message prep takes {prep_overhead_pct:.0f}% of target interval - rate too high for message size")
+        elif prep_overhead_pct > 20:
+            print(f"⚠️  Message prep takes {prep_overhead_pct:.0f}% of target interval - approaching limits")
+        else:
+            print(f"✅ Message prep overhead is acceptable ({prep_overhead_pct:.0f}%)")
         
         time.sleep(5)
         pub_socket.close()
