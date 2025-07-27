@@ -359,14 +359,12 @@ func (c *PubSubConsumer) responsePublisher(responseQueue <-chan Response, proces
 	fmt.Printf("Consumer: Publishing responses on port %d\n", c.vizPort)
 
 	for response := range responseQueue {
-		sendStart := time.Now()
 		responseBytes, err := json.Marshal(response)
 		if err != nil {
 			continue
 		}
 
 		_, err = pubSocket.SendMessage("response", responseBytes)
-		sendTime := time.Since(sendStart).Seconds() * 1e6
 
 		if err == nil {
 			atomic.AddInt64(processedCount, 1)
