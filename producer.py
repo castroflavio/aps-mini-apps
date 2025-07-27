@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.0
+Version 2.1
 """
 
 import time
@@ -43,28 +43,15 @@ class PubSubProducer:
         return int(time.time() * 1_000_000)
     
     def export_measurements_csv(self, filename):
-        with open(filename, 'w', newline='') as f:
-            if self.measurements:
-                fieldnames = ['seq_n', 'msg_id', 't1', 't2', 't3', 't4', 'message_size', 
-                             'clock_offset_ms', 'network_delay_ms', 'processing_delay_ms', 'total_delay_ms']
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self.measurements)
+        if self.measurements:
+            pd.DataFrame(self.measurements).to_csv(filename, index=False)
     
     def analyze_network_csv(self, csv_file, rate_hz, msg_size):
         df = pd.read_csv(csv_file)
-        expected_bps = rate_hz * msg_size * 8
-        threshold = expected_bps * 0.1
-        streaming_data = df[df['tx_throughput_bps'] > threshold]
-        if len(streaming_data) < 2:
-            print("Network analysis: Insufficient streaming data")
-            return
-        tx_bps = streaming_data['tx_throughput_bps'].values
-        tx_pps = streaming_data['tx_throughput_pps'].values
-        print(f"\n=== Network Analysis ===")
-        print(f"Streaming samples: {len(streaming_data)}")
-        print(f"TX BPS - Avg: {np.mean(tx_bps):.0f}, P50: {np.percentile(tx_bps, 50):.0f}, P99: {np.percentile(tx_bps, 99):.0f}")
-        print(f"TX PPS - Avg: {np.mean(tx_pps):.0f}, P50: {np.percentile(tx_pps, 50):.0f}, P99: {np.percentile(tx_pps, 99):.0f}")
+        streaming_data = df[df['tx_throughput_bps'] > rate_hz * msg_size * 0.8]
+        if len(streaming_data) > 1:
+            tx_bps, tx_pps = streaming_data['tx_throughput_bps'].values, streaming_data['tx_throughput_pps'].values
+            print(f"Network: {len(streaming_data)} samples, TX BPS: {np.mean(tx_bps):.0f}±{np.std(tx_bps):.0f}, TX PPS: {np.mean(tx_pps):.0f}±{np.std(tx_pps):.0f}")
     
     def _prepare_messages(self, total_messages, msg_size, rate_hz, use_cache=False):
         """Prepare messages for sending - either cached or pre-generated"""
@@ -75,91 +62,42 @@ class PubSubProducer:
             # DAQ-style caching approach
             cache_file = f"producer_cache_{rate_hz}hz_{total_messages}msg_{msg_size}b.npy"
             try:
-                print(f"Loading cached messages from {cache_file}...")
-                cached_data = np.load(cache_file, allow_pickle=True)
-                print(f"Loaded {len(cached_data)} cached messages")
-                return cached_data
+                return np.load(cache_file, allow_pickle=True)
             except FileNotFoundError:
-                print("Pre-serializing all messages for cache...")
-                pre_serialized_messages = []
-                for i in range(total_messages):
-                    msg_id = f"{i}"
-                    # Create message with fixed-width timestamp field
-                    prefix = b'request|seq_n=' + str(i).encode() + b'|msg_id=' + msg_id.encode() + b'|t1='
-                    timestamp_field = b'0' * timestamp_width  # Fixed-width placeholder
-                    suffix = b'|data=' + data_payload
-                    message_data = prefix + timestamp_field + suffix
-                    timestamp_offset = len(prefix)  # Position where timestamp starts
-                    pre_serialized_messages.append((message_data, msg_id, timestamp_offset))
-                
-                cached_data = np.array(pre_serialized_messages, dtype=object)
+                messages = [(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=' + b'0'*20 + b'|data=' + data_payload, str(i), len(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=')) for i in range(total_messages)]
+                cached_data = np.array(messages, dtype=object)
                 np.save(cache_file, cached_data)
-                print(f"Cached {len(pre_serialized_messages)} messages to {cache_file}")
                 return cached_data
         else:
-            # Simple pre-generation without caching
-            print("Pre-generating messages...")
-            pre_generated_messages = []
-            for i in range(total_messages):
-                msg_id = f"{i}"
-                # Create message with fixed-width timestamp field
-                prefix = b'request|seq_n=' + str(i).encode() + b'|msg_id=' + msg_id.encode() + b'|t1='
-                timestamp_field = b'0' * timestamp_width  # Fixed-width placeholder
-                suffix = b'|data=' + data_payload
-                message_data = bytearray(prefix + timestamp_field + suffix)  # Mutable for O(1) updates
-                timestamp_offset = len(prefix)  # Position where timestamp starts
-                pre_generated_messages.append((message_data, msg_id, timestamp_offset))
-            print(f"Pre-generated {len(pre_generated_messages)} messages")
-            return pre_generated_messages
+            return [(bytearray(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=' + b'0'*20 + b'|data=' + data_payload), str(i), len(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=')) for i in range(total_messages)]
     
     def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0', use_cache=False):
-        # Setup control and data sockets
         control_socket = self.context.socket(zmq.REP)
         control_socket.bind(f"tcp://*:{self.control_port}")
         pub_socket = self.context.socket(zmq.PUB)
         pub_socket.bind(f"tcp://*:{self.data_port}")
         
-        print(f"Producer: {rate_hz}Hz, {duration_sec}s, msg_size={msg_size}")
-        
-        # Start network monitoring
         network_csv = f"network_{interface}_{int(time.time())}.csv"
-        monitor_proc = subprocess.Popen([
-            'python', 'network_throughput_monitor.py',
-            '-i', interface, '-d', str(duration_sec + 10), '-o', network_csv
-        ])
-        print(f"Network monitoring started: {network_csv}")
-        time.sleep(0.2)  # Let monitor initialize
+        monitor_proc = subprocess.Popen(['python', 'network_throughput_monitor.py', '-i', interface, '-d', str(duration_sec + 10), '-o', network_csv])
+        time.sleep(0.2)
 
-        # Wait for consumer start signal
-        print("Producer: waiting for consumer start...")
         control_socket.recv_string()
         control_socket.send_string("start")
         control_socket.close()
-        print("Producer: consumer start, starting test...")
         
-        # Setup visualization socket after control message
         viz_socket = self.context.socket(zmq.SUB)
         viz_socket.connect(f"tcp://{self.viz_ip}:{self.viz_port}")
         viz_socket.setsockopt(zmq.SUBSCRIBE, b"response")
         threading.Thread(target=self._vizualization_listener, args=(viz_socket,), daemon=True).start()
         
-        # Main streaming loop
         total_messages = int(rate_hz * duration_sec)
-        print(f"Generating {total_messages} messages")
         self.streaming_started = True
         start_time = time.time()
         seq_n = 0
-        
-        # Compensating sleep strategy for precise timing
         interval = 1.0 / rate_hz
         next_send_time = time.time()
-        
-        # Prepare messages using selected strategy
         prepared_messages = self._prepare_messages(total_messages, msg_size, rate_hz, use_cache)
         skipped = 0
-        
-        # Direct send approach - avoid queue overhead (1135ns) since ZMQ send (2220ns) is the real bottleneck
-        # Use simple timestamp serialization (168ns) since it's much faster than alternatives
         
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
             message_data, msg_id, timestamp_offset = prepared_messages[seq_n]
@@ -174,37 +112,21 @@ class PubSubProducer:
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
             
             try:
-                # Direct ZMQ send - avoid queue overhead (1135ns) since ZMQ (2220ns) dominates anyway
                 pub_socket.send_multipart([b"request", final_message], flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
-                print("ZMQ queue full! Skipped message")
                 skipped += 1
-                self.pending_messages.pop(msg_id)  # Remove from pending since not sent
-            
-            if seq_n % rate_hz == 0:
-                print(f"Producer: sent seq={seq_n}, msg_size={msg_size}B")
+                self.pending_messages.pop(msg_id)
             seq_n += 1
             
-            # Compensating sleep for precise rate control
             next_send_time += interval
             sleep_time = next_send_time - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            else:
-                # Can't keep up with target rate!
-                if seq_n % 100 == 0:
-                    print(f"WARNING: {-sleep_time*1000:.1f}ms behind schedule")
         
-        print(f"Producer: sent {seq_n} messages ({skipped} skipped) in {time.time() - start_time:.1f}s")
-        time.sleep(5) # Analysis timeout time at the producer
+        time.sleep(5)
         pub_socket.close()
         viz_socket.close()
-        
-        # Wait for network monitoring to complete
         monitor_proc.wait()
-        print(f"Network monitoring completed: {network_csv}")
-        
-        print(f"Producer: completed {len(self.measurements)}/{total_messages} measurements")
         return network_csv
     
     def _vizualization_listener(self, viz_socket):
@@ -216,20 +138,10 @@ class PubSubProducer:
                 if response['type'] == 'response' and response['msg_id'] in self.pending_messages:
                     t4 = self.timestamp_us()
                     pending = self.pending_messages.pop(response['msg_id'])
-                    
-                    measurement = create_measurement(
-                        pending['seq_n'], response['msg_id'], pending['t1'], 
-                        response['t2'], response['t3'], t4, pending['msg_size']
-                    )
-                    self.measurements.append(measurement)
-                    
-                    if len(self.measurements) % 100 == 0:
-                        print(f"Producer: {len(self.measurements)} processed messages, "
-                              f"offset={measurement['clock_offset_ms']}ms")
+                    self.measurements.append(create_measurement(pending['seq_n'], response['msg_id'], pending['t1'], response['t2'], response['t3'], t4, pending['msg_size']))
             except zmq.Again:
                 time.sleep(0.001)
-            except Exception as e:
-                print(f"Producer error: {e}")
+            except Exception:
                 break
 
 @click.command()
