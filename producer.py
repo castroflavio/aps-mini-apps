@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.3
+Version 2.4
 """
 
 import time
@@ -51,7 +51,8 @@ class PubSubProducer:
         streaming_data = df[df['tx_throughput_bps'] > rate_hz * msg_size * 0.8]
         if len(streaming_data) > 1:
             tx_bps, tx_pps = streaming_data['tx_throughput_bps'].values, streaming_data['tx_throughput_pps'].values
-            print(f"Network: {len(streaming_data)} samples, TX BPS: {np.mean(tx_bps):.0f}±{np.std(tx_bps):.0f}, TX PPS: {np.mean(tx_pps):.0f}±{np.std(tx_pps):.0f}")
+            tx_gbps = tx_bps / 1e9  # Convert to Gbps
+            print(f"Network: {len(streaming_data)} samples, TX: {np.mean(tx_gbps):.2f}±{np.std(tx_gbps):.2f} Gbps, PPS: {np.mean(tx_pps):.0f}±{np.std(tx_pps):.0f}")
     
     def _prepare_messages(self, total_messages, msg_size, rate_hz, use_cache=False):
         """Prepare messages for sending - either cached or pre-generated"""
@@ -132,6 +133,17 @@ class PubSubProducer:
                     behind_ms = -sleep_time * 1000
                     actual_rate = seq_n / (time.time() - start_time)
                     print(f"WARNING: {behind_ms:.1f}ms behind, actual rate: {actual_rate:.1f}Hz (target: {rate_hz}Hz)")
+        
+        elapsed_time = time.time() - start_time
+        actual_rate = seq_n / elapsed_time
+        total_bytes = seq_n * msg_size
+        throughput_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
+        
+        print(f"\n=== Producer Summary ===")
+        print(f"Messages sent: {seq_n:,} ({skipped:,} skipped)")
+        print(f"Duration: {elapsed_time:.1f}s")
+        print(f"Rate: {actual_rate:.1f} Hz (target: {rate_hz} Hz)")
+        print(f"Throughput: {throughput_gbps:.2f} Gbps")
         
         time.sleep(5)
         pub_socket.close()
