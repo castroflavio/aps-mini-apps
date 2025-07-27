@@ -467,6 +467,6 @@ func main() {
 	}
 
 	// Analyze network data using Python script
-	p.analyzeNetworkCSV(networkCSV, *rate, *msgSize)
+	producer.analyzeNetworkCSV(networkCSV, *rate, *msgSize)
 	fmt.Printf("Network monitoring data: %s\n", networkCSV)
 }
