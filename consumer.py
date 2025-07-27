@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Consumer with 4-Timestamp NTP Method
-Version 1.0
+Version 2.0
 """
 
 import time
@@ -46,16 +46,23 @@ class PubSubConsumer:
         while time.time() - start_time < duration_sec:
             try:
                 topic, data = sub_socket.recv_multipart(zmq.NOBLOCK)
-                request = json.loads(data.decode())
                 
-                if request['type'] == 'request':
+                # Parse raw format: request|seq_n=123|msg_id=456|t1=12345678901234567890|data=xxx...
+                msg_str = data.decode()
+                if msg_str.startswith('request|'):
+                    # Extract fields from pipe-delimited format
+                    parts = msg_str.split('|')
+                    seq_n = int(parts[1].split('=')[1])
+                    msg_id = parts[2].split('=')[1]
+                    t1 = int(parts[3].split('=')[1])
+                    
                     t2 = self.timestamp_us()
                     time.sleep(processing_time_ms / 1000)  # configurable processing time in ms
                     t3 = self.timestamp_us()
                     
                     response = {
-                        'type': 'response', 'msg_id': request['msg_id'], 'seq_n': request['seq_n'],
-                        't2': t2, 't3': t3, 'original_size': request['msg_size'], 'status': 'processed'
+                        'type': 'response', 'msg_id': msg_id, 'seq_n': seq_n,
+                        't2': t2, 't3': t3, 'status': 'processed'
                     }
                     
                     pub_socket.send_multipart([b"response", json.dumps(response).encode()])
