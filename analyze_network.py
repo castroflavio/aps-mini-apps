@@ -33,9 +33,9 @@ def analyze_network_csv(csv_file, rate_hz, msg_size):
             print("Network: CSV missing required columns (tx_throughput_bps, tx_throughput_pps)")
             return
         
-        # Filter for relevant throughput data (80% of expected rate)
+        # Filter for relevant throughput data (12% of expected rate)
         expected_bps = rate_hz * msg_size * 8  # Convert to bits per second
-        threshold = expected_bps * 0.8
+        threshold = expected_bps * 0.12
         data = df[df['tx_throughput_bps'] > threshold]
         
         if len(data) > 1:
