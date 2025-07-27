@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.6
+Version 2.7
 """
 
 import time
@@ -65,12 +65,20 @@ class PubSubProducer:
             try:
                 return np.load(cache_file, allow_pickle=True)
             except FileNotFoundError:
+                    # Use bytes for cached (immutable) - will need concatenation
                 messages = [(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=' + b'0'*20 + b'|data=' + data_payload, str(i), len(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=')) for i in range(total_messages)]
                 cached_data = np.array(messages, dtype=object)
                 np.save(cache_file, cached_data)
                 return cached_data
         else:
-            return [(bytearray(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=' + b'0'*20 + b'|data=' + data_payload), str(i), len(b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1=')) for i in range(total_messages)]
+            # Use bytearray for in-place timestamp updates (critical for large messages)
+            messages = []
+            for i in range(total_messages):
+                prefix = b'request|seq_n=' + str(i).encode() + b'|msg_id=' + str(i).encode() + b'|t1='
+                message_data = bytearray(prefix + b'0'*20 + b'|data=' + data_payload)
+                timestamp_offset = len(prefix)
+                messages.append((message_data, str(i), timestamp_offset))
+            return messages
     
     def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0', use_cache=False):
         control_socket = self.context.socket(zmq.REP)
@@ -117,9 +125,15 @@ class PubSubProducer:
             timestamp_bytes = str(t1).encode().ljust(20, b'0')[:20]
             time_timestamp += time.perf_counter() - t_start
             
-            # Time string concatenation
+            # Time message preparation (in-place vs concatenation)
             t_start = time.perf_counter()
-            final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
+            if isinstance(message_data, bytearray):
+                # In-place update for bytearray (fast for large messages)
+                message_data[timestamp_offset:timestamp_offset+20] = timestamp_bytes
+                final_message = bytes(message_data)  # Convert to immutable bytes for ZMQ
+            else:
+                # String concatenation for cached numpy arrays (slow for large messages)
+                final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
             time_string_concat += time.perf_counter() - t_start
             
             # Time dictionary update
@@ -181,6 +195,13 @@ class PubSubProducer:
         print(f"Avg dict update:   {avg_dict_us:.1f}µs ({100*time_dict_update/total_time:.1f}%)")
         print(f"Avg ZMQ send:      {avg_send_us:.1f}µs ({100*time_zmq_send/total_time:.1f}%)")
         print(f"Total per msg:     {total_processing_us:.1f}µs (max rate: {1e6/total_processing_us:.0f} Hz)")
+        
+        # Performance recommendation
+        if msg_size > 1024*1024:  # >1MB messages
+            if any(isinstance(m[0], bytearray) for m in prepared_messages[:1]):
+                print(f"✅ Using in-place updates for {msg_size//1024//1024}MB messages (optimal)")
+            else:
+                print(f"⚠️  Using concatenation for {msg_size//1024//1024}MB messages. Consider avoiding --cache flag for better performance.")
         
         # Flag suspicious timings
         if avg_concat_us > 1000:  # >1ms is suspicious for string concatenation
