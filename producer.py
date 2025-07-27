@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 2.5
+Version 2.6
 """
 
 import time
@@ -102,9 +102,10 @@ class PubSubProducer:
         skipped = 0
         sent_count = 0
         
-        # Bottleneck timing instrumentation
+        # Bottleneck timing instrumentation (fine-grained)
         time_timestamp = 0
-        time_message_prep = 0
+        time_string_concat = 0
+        time_dict_update = 0
         time_zmq_send = 0
         
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
@@ -116,11 +117,15 @@ class PubSubProducer:
             timestamp_bytes = str(t1).encode().ljust(20, b'0')[:20]
             time_timestamp += time.perf_counter() - t_start
             
-            # Time message preparation
+            # Time string concatenation
             t_start = time.perf_counter()
             final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
+            time_string_concat += time.perf_counter() - t_start
+            
+            # Time dictionary update
+            t_start = time.perf_counter()
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
-            time_message_prep += time.perf_counter() - t_start
+            time_dict_update += time.perf_counter() - t_start
             
             # Time ZMQ send
             t_start = time.perf_counter()
@@ -130,7 +135,7 @@ class PubSubProducer:
             except zmq.Again:
                 skipped += 1
                 self.pending_messages.pop(msg_id)
-                if seq_n % 10 == 0:
+                if seq_n % 100 == 0:  # Less frequent to reduce print overhead
                     print(f"ZMQ queue full! Skipped {skipped}/{seq_n} messages ({100*skipped/seq_n:.1f}%)")
             time_zmq_send += time.perf_counter() - t_start
             
@@ -142,7 +147,7 @@ class PubSubProducer:
                 time.sleep(sleep_time)
             else:
                 # Critical: warn if falling behind at high rates
-                if seq_n % 100 == 0:  # Every 100 messages
+                if seq_n % 1000 == 0:  # Every 1000 messages (reduce overhead)
                     behind_ms = -sleep_time * 1000
                     current_attempt_rate = seq_n / (time.time() - start_time)
                     current_success_rate = sent_count / (time.time() - start_time)
@@ -162,17 +167,28 @@ class PubSubProducer:
         print(f"Success rate: {success_rate:.1f} Hz")
         print(f"Throughput: {throughput_gbps:.2f} Gbps")
         
-        # Bottleneck analysis
+        # Fine-grained bottleneck analysis
+        total_time = time_timestamp + time_string_concat + time_dict_update + time_zmq_send
         avg_timestamp_us = (time_timestamp / seq_n) * 1e6
-        avg_prep_us = (time_message_prep / seq_n) * 1e6
+        avg_concat_us = (time_string_concat / seq_n) * 1e6
+        avg_dict_us = (time_dict_update / seq_n) * 1e6
         avg_send_us = (time_zmq_send / seq_n) * 1e6
-        total_processing_us = avg_timestamp_us + avg_prep_us + avg_send_us
+        total_processing_us = avg_timestamp_us + avg_concat_us + avg_dict_us + avg_send_us
         
-        print(f"\n=== Bottleneck Analysis ===")
-        print(f"Avg timestamp: {avg_timestamp_us:.1f}µs ({100*time_timestamp/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
-        print(f"Avg msg prep:  {avg_prep_us:.1f}µs ({100*time_message_prep/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
-        print(f"Avg ZMQ send:  {avg_send_us:.1f}µs ({100*time_zmq_send/(time_timestamp+time_message_prep+time_zmq_send):.1f}%)")
-        print(f"Total per msg: {total_processing_us:.1f}µs (max rate: {1e6/total_processing_us:.0f} Hz)")
+        print(f"\n=== Fine-Grained Bottleneck Analysis ===")
+        print(f"Avg timestamp:    {avg_timestamp_us:.1f}µs ({100*time_timestamp/total_time:.1f}%)")
+        print(f"Avg string concat: {avg_concat_us:.1f}µs ({100*time_string_concat/total_time:.1f}%)")
+        print(f"Avg dict update:   {avg_dict_us:.1f}µs ({100*time_dict_update/total_time:.1f}%)")
+        print(f"Avg ZMQ send:      {avg_send_us:.1f}µs ({100*time_zmq_send/total_time:.1f}%)")
+        print(f"Total per msg:     {total_processing_us:.1f}µs (max rate: {1e6/total_processing_us:.0f} Hz)")
+        
+        # Flag suspicious timings
+        if avg_concat_us > 1000:  # >1ms is suspicious for string concatenation
+            print(f"⚠️  String concatenation is unusually slow ({avg_concat_us:.0f}µs). Check message size or memory allocation.")
+        if avg_dict_us > 500:  # >0.5ms is suspicious for dict update
+            print(f"⚠️  Dictionary updates are slow ({avg_dict_us:.0f}µs). Check pending_messages size: {len(self.pending_messages)}")
+        if avg_send_us > 10000:  # >10ms suggests network issues
+            print(f"⚠️  ZMQ sends are very slow ({avg_send_us:.0f}µs). Check network or consumer performance.")
         
         time.sleep(5)
         pub_socket.close()
