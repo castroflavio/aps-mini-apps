@@ -173,7 +173,7 @@ func (c *PubSubConsumer) runConsumer(durationSec int, processingTimeMs float64) 
 			
 			currentReceived := atomic.LoadInt64(&receivedCount)
 			currentProcessed := atomic.LoadInt64(&processedCount)
-			currentBytes := atomic.LoadInt64(&totalBytes)
+			_ = atomic.LoadInt64(&totalBytes) // currentBytes unused in this context
 			
 			elapsed := time.Since(lastReportTime).Seconds()
 			recentReceived := currentReceived - lastReportCount
@@ -265,9 +265,7 @@ func (c *PubSubConsumer) receiverWorker(channelID int, workQueue chan<- WorkItem
 
 	startTime := time.Now()
 	for time.Since(startTime).Seconds() < float64(durationSec) {
-		recvStart := time.Now()
 		parts, err := subSocket.RecvMessage(zmq.DONTWAIT)
-		recvTime := time.Since(recvStart).Seconds() * 1e6
 
 		if err != nil {
 			time.Sleep(1 * time.Millisecond)
@@ -308,10 +306,8 @@ func (c *PubSubConsumer) processingWorker(workQueue <-chan WorkItem, responseQue
 	processingDuration := time.Duration(processingTimeMs * float64(time.Millisecond))
 
 	for workItem := range workQueue {
-		processStart := time.Now()
 		time.Sleep(processingDuration)
 		t3 := timestampUs()
-		processTime := time.Since(processStart).Seconds() * 1e6
 
 		response := Response{
 			Type:   "response",
