@@ -265,7 +265,9 @@ func (c *PubSubConsumer) receiverWorker(channelID int, workQueue chan<- WorkItem
 
 	startTime := time.Now()
 	for time.Since(startTime).Seconds() < float64(durationSec) {
+		recvStart := time.Now()
 		parts, err := subSocket.RecvMessage(zmq.DONTWAIT)
+		recvTime := time.Since(recvStart).Seconds() * 1e6
 
 		if err != nil {
 			time.Sleep(1 * time.Millisecond)
@@ -295,6 +297,11 @@ func (c *PubSubConsumer) receiverWorker(channelID int, workQueue chan<- WorkItem
 		case workQueue <- workItem:
 			atomic.AddInt64(receivedCount, 1)
 			atomic.AddInt64(totalBytes, int64(len(parts[1])))
+			
+			// Sample timing data occasionally to avoid memory bloat
+			if parsed.SeqN%100 == 0 && len(*recvTimes) < 1000 {
+				*recvTimes = append(*recvTimes, recvTime)
+			}
 		default:
 			// Queue full, drop message
 		}
@@ -306,8 +313,10 @@ func (c *PubSubConsumer) processingWorker(workQueue <-chan WorkItem, responseQue
 	processingDuration := time.Duration(processingTimeMs * float64(time.Millisecond))
 
 	for workItem := range workQueue {
+		processStart := time.Now()
 		time.Sleep(processingDuration)
 		t3 := timestampUs()
+		processTime := time.Since(processStart).Seconds() * 1e6
 
 		response := Response{
 			Type:   "response",
@@ -320,7 +329,10 @@ func (c *PubSubConsumer) processingWorker(workQueue <-chan WorkItem, responseQue
 
 		select {
 		case responseQueue <- response:
-			// Successfully queued
+			// Sample timing data occasionally
+			if workItem.SeqN%100 == 0 && len(*processTimes) < 1000 {
+				*processTimes = append(*processTimes, processTime)
+			}
 		default:
 			// Response queue full, drop
 		}
@@ -359,15 +371,22 @@ func (c *PubSubConsumer) responsePublisher(responseQueue <-chan Response, proces
 	fmt.Printf("Consumer: Publishing responses on port %d\n", c.vizPort)
 
 	for response := range responseQueue {
+		sendStart := time.Now()
 		responseBytes, err := json.Marshal(response)
 		if err != nil {
 			continue
 		}
 
 		_, err = pubSocket.SendMessage("response", responseBytes)
+		sendTime := time.Since(sendStart).Seconds() * 1e6
 
 		if err == nil {
 			atomic.AddInt64(processedCount, 1)
+			
+			// Sample timing data occasionally
+			if response.SeqN%100 == 0 && len(*sendTimes) < 1000 {
+				*sendTimes = append(*sendTimes, sendTime)
+			}
 		}
 	}
 }
@@ -386,6 +405,30 @@ func (c *PubSubConsumer) printFinalStats(receivedCount, processedCount, totalByt
 		avgThroughputMbps, avgThroughputMbps/1000)
 	fmt.Printf("Processing efficiency: %.1f%%\n", 
 		(float64(processedCount)/float64(receivedCount))*100)
+
+	// Timing analysis if we have data
+	if len(recvTimes) > 0 {
+		fmt.Printf("\n=== Timing Analysis ===\n")
+		recvMean, _, _ := calculateStats(recvTimes)
+		procMean, _, _ := calculateStats(processTimes)
+		sendMean, _, _ := calculateStats(sendTimes)
+		
+		fmt.Printf("Receive: %.0fµs | Process: %.0fµs | Send: %.0fµs\n", 
+			recvMean, procMean, sendMean)
+		
+		totalMean := recvMean + procMean + sendMean
+		maxTheoretical := 1e6 / totalMean
+		
+		fmt.Printf("Total per message: %.0fµs | Theoretical max: %.0f Hz\n", 
+			totalMean, maxTheoretical)
+		
+		if avgRecvRate < maxTheoretical * 0.8 {
+			fmt.Printf("⚠️  Consumer may be bottleneck (%.1f%% of theoretical max)\n", 
+				(avgRecvRate/maxTheoretical)*100)
+		} else {
+			fmt.Printf("✅ Consumer keeping up well\n")
+		}
+	}
 }
 
 // calculateStats computes mean, P95, and P99 from timing data
@@ -428,7 +471,7 @@ func main() {
 	duration := flag.Int("t", 60, "Duration seconds")
 	producerIP := flag.String("producer-ip", "localhost", "Producer IP address")
 	producerDataPort := flag.Int("producer-data-port", 5555, "Producer base port")
-	vizPort := flag.Int("viz-port", 5556, "Consumer publisher port")
+	vizPort := flag.Int("viz-port", 5570, "Consumer publisher port")
 	controlPort := flag.Int("control-port", 5557, "Control channel port")
 	processingTimeMs := flag.Float64("processing-time-ms", 0.4, "Processing time in milliseconds")
 	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")

@@ -508,7 +508,7 @@ func main() {
 	duration := flag.Int("t", 60, "Duration seconds")
 	msgSize := flag.Int("s", 1024, "Message size in bytes")
 	dataPort := flag.Int("data-port", 5555, "Producer publisher port")
-	vizPort := flag.Int("viz-port", 5556, "Client publisher port")
+	vizPort := flag.Int("viz-port", 5570, "Client publisher port")
 	controlPort := flag.Int("control-port", 5557, "Control channel port")
 	vizIP := flag.String("viz-ip", "localhost", "Visualization IP address")
 	iface := flag.String("i", "lo0", "Network interface for monitoring")
