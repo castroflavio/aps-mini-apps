@@ -93,18 +93,56 @@ func createMeasurement(seqN int, msgID string, t1, t2, t3, t4 int64, msgSize int
 }
 
 // prepareMessages creates pre-allocated message templates with fixed-width timestamp slots
-func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int) [][]byte {
+func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int, rateHz float64, useCache bool) [][]byte {
 	dataPayload := strings.Repeat("x", msgSize)
-	messages := make([][]byte, totalMessages)
 	
-	for i := 0; i < totalMessages; i++ {
-		// Format: request|seq_n=123|msg_id=456|t1=12345678901234567890|data=xxx
-		template := fmt.Sprintf("request|seq_n=%d|msg_id=%d|t1=%020d|data=%s", 
-			i, i, 0, dataPayload)
-		messages[i] = []byte(template)
+	if useCache {
+		// DAQ-style caching approach
+		cacheFile := fmt.Sprintf("producer_cache_%.0fhz_%dmsg_%db.json", rateHz, totalMessages, msgSize)
+		
+		// Try to load from cache file
+		if data, err := os.ReadFile(cacheFile); err == nil {
+			var cached []string
+			if json.Unmarshal(data, &cached) == nil && len(cached) == totalMessages {
+				fmt.Printf("Loaded %d messages from cache: %s\n", totalMessages, cacheFile)
+				messages := make([][]byte, totalMessages)
+				for i, msg := range cached {
+					messages[i] = []byte(msg)
+				}
+				return messages
+			}
+		}
+		
+		// Cache miss - generate and save
+		messages := make([][]byte, totalMessages)
+		cached := make([]string, totalMessages)
+		
+		for i := 0; i < totalMessages; i++ {
+			template := fmt.Sprintf("request|seq_n=%d|msg_id=%d|t1=%020d|data=%s", 
+				i, i, 0, dataPayload)
+			messages[i] = []byte(template)
+			cached[i] = template
+		}
+		
+		// Save to cache file
+		if data, err := json.Marshal(cached); err == nil {
+			os.WriteFile(cacheFile, data, 0644)
+			fmt.Printf("Saved %d messages to cache: %s\n", totalMessages, cacheFile)
+		}
+		
+		return messages
+	} else {
+		// Non-cached approach - generate fresh messages
+		messages := make([][]byte, totalMessages)
+		
+		for i := 0; i < totalMessages; i++ {
+			template := fmt.Sprintf("request|seq_n=%d|msg_id=%d|t1=%020d|data=%s", 
+				i, i, 0, dataPayload)
+			messages[i] = []byte(template)
+		}
+		
+		return messages
 	}
-	
-	return messages
 }
 
 // setupNetworking initializes ZMQ sockets and network monitoring
@@ -355,7 +393,7 @@ func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, rateHz float64, msgSi
 }
 
 // runProducer executes the main producer logic
-func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string) (string, error) {
+func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string, useCache bool) (string, error) {
 	controlSocket, pubSocket, vizSocket, monitorProc, networkCSV, err := p.setupNetworking(iface, durationSec)
 	if err != nil {
 		return "", err
@@ -364,7 +402,7 @@ func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, i
 	defer vizSocket.Close()
 
 	totalMessages := int(rateHz * float64(durationSec))
-	preparedMessages := p.prepareMessages(totalMessages, msgSize)
+	preparedMessages := p.prepareMessages(totalMessages, msgSize, rateHz, useCache)
 	
 	err = p.waitForConsumer(controlSocket)
 	if err != nil {
@@ -423,13 +461,14 @@ func main() {
 	vizIP := flag.String("viz-ip", "localhost", "Visualization IP address")
 	iface := flag.String("i", "lo0", "Network interface for monitoring")
 	output := flag.String("output", "producer_results.csv", "Output CSV filename")
+	cache := flag.Bool("cache", false, "Use DAQ-style message caching")
 	flag.Parse()
 
 	fmt.Printf("Go Pub-Sub Producer v1.0 - High Performance\n")
 	fmt.Printf("Rate: %.1f Hz | Duration: %ds | Message Size: %d bytes\n", *rate, *duration, *msgSize)
 
 	producer := NewPubSubProducer("producer", *dataPort, *vizPort, *vizIP, *controlPort)
-	networkCSV, err := producer.runProducer(*rate, *duration, *msgSize, *iface)
+	networkCSV, err := producer.runProducer(*rate, *duration, *msgSize, *iface, *cache)
 	if err != nil {
 		log.Fatalf("Producer error: %v", err)
 	}
