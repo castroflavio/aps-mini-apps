@@ -224,7 +224,7 @@ func (c *PubSubConsumer) runConsumer(durationSec int, processingTimeMs float64) 
 			continue
 		}
 
-		err = pubSocket.SendMessage("response", responseBytes)
+		_, err = pubSocket.SendMessage("response", responseBytes)
 		if err != nil {
 			fmt.Printf("Send response error: %v\n", err)
 			continue
