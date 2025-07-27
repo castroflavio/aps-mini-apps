@@ -164,9 +164,9 @@ class PubSubProducer:
     
     def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0', use_cache=False):
         control_socket, pub_socket, viz_socket, monitor_proc, network_csv = self._setup_networking(interface, duration_sec)
-        self._wait_for_consumer(control_socket)
         total_messages = int(rate_hz * duration_sec)
         prepared_messages = self._prepare_messages(total_messages, msg_size, rate_hz, use_cache)
+        self._wait_for_consumer(control_socket)
         self.streaming_started = True
         results = self._stream_messages(pub_socket, prepared_messages, rate_hz, duration_sec, msg_size)
         self._analyze_performance(results, rate_hz, msg_size, prepared_messages)
