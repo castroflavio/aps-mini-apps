@@ -472,7 +472,7 @@ func main() {
 	producerIP := flag.String("producer-ip", "localhost", "Producer IP address")
 	producerDataPort := flag.Int("producer-data-port", 5555, "Producer base port")
 	vizPort := flag.Int("viz-port", 5570, "Consumer publisher port")
-	controlPort := flag.Int("control-port", 5557, "Control channel port")
+	controlPort := flag.Int("control-port", 5580, "Control channel port")
 	processingTimeMs := flag.Float64("processing-time-ms", 0.4, "Processing time in milliseconds")
 	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")
 	numWorkers := flag.Int("workers", 0, "Number of worker threads (0 = CPU count)")
