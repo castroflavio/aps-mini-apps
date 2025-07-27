@@ -339,6 +339,21 @@ func (p *PubSubProducer) visualizationListener(vizSocket *zmq.Socket) {
 	}
 }
 
+// analyzeNetworkCSV calls the Python network analysis script
+func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, rateHz float64, msgSize int) {
+	cmd := exec.Command("python3", "analyze_network.py", csvFile, 
+		"-r", fmt.Sprintf("%.1f", rateHz), 
+		"-s", strconv.Itoa(msgSize))
+	
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("Network analysis failed: %v\n", err)
+		return
+	}
+	
+	fmt.Print(string(output))
+}
+
 // runProducer executes the main producer logic
 func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string) (string, error) {
 	controlSocket, pubSocket, vizSocket, monitorProc, networkCSV, err := p.setupNetworking(iface, durationSec)
@@ -451,5 +466,7 @@ func main() {
 		}
 	}
 
+	// Analyze network data using Python script
+	p.analyzeNetworkCSV(networkCSV, *rate, *msgSize)
 	fmt.Printf("Network monitoring data: %s\n", networkCSV)
 }
