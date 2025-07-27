@@ -347,7 +347,18 @@ func (c *PubSubConsumer) responsePublisher(responseQueue <-chan Response, proces
 	}
 	defer pubSocket.Close()
 
-	pubSocket.Bind(fmt.Sprintf("tcp://*:%d", c.vizPort))
+	err = pubSocket.SetLinger(0) // Don't wait on close
+	if err != nil {
+		log.Printf("Response publisher linger error: %v", err)
+		return
+	}
+	
+	err = pubSocket.Bind(fmt.Sprintf("tcp://*:%d", c.vizPort))
+	if err != nil {
+		log.Printf("Response publisher bind error on port %d: %v", c.vizPort, err)
+		return
+	}
+	
 	pubSocket.SetSndhwm(10000)
 	fmt.Printf("Consumer: Publishing responses on port %d\n", c.vizPort)
 
@@ -426,7 +437,7 @@ func main() {
 	vizPort := flag.Int("viz-port", 5556, "Consumer publisher port")
 	controlPort := flag.Int("control-port", 5557, "Control channel port")
 	processingTimeMs := flag.Float64("processing-time-ms", 0.4, "Processing time in milliseconds")
-	numChannels := flag.Int("channels", 4, "Number of ZMQ channels")
+	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")
 	numWorkers := flag.Int("workers", 0, "Number of worker threads (0 = CPU count)")
 	flag.Parse()
 

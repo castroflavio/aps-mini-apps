@@ -178,9 +178,13 @@ func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.So
 	if err != nil {
 		return nil, nil, nil, nil, "", err
 	}
-	err = controlSocket.Bind(fmt.Sprintf("tcp://*:%d", p.controlPort))
+	err = controlSocket.SetLinger(0) // Don't wait on close
 	if err != nil {
 		return nil, nil, nil, nil, "", err
+	}
+	err = controlSocket.Bind(fmt.Sprintf("tcp://*:%d", p.controlPort))
+	if err != nil {
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to bind control port %d: %v", p.controlPort, err)
 	}
 
 	// Create multiple publisher sockets (one per channel)
@@ -201,11 +205,17 @@ func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.So
 			return nil, nil, nil, nil, "", err
 		}
 		
+		err = pubSocket.SetLinger(0) // Don't wait on close
+		if err != nil {
+			pubSocket.Close()
+			return nil, nil, nil, nil, "", err
+		}
+		
 		port := p.dataPort + i
 		err = pubSocket.Bind(fmt.Sprintf("tcp://*:%d", port))
 		if err != nil {
 			pubSocket.Close()
-			return nil, nil, nil, nil, "", err
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to bind data port %d: %v (try different port or wait a moment)", port, err)
 		}
 		
 		pubSockets[i] = pubSocket
@@ -504,7 +514,7 @@ func main() {
 	iface := flag.String("i", "lo0", "Network interface for monitoring")
 	output := flag.String("output", "producer_results.csv", "Output CSV filename")
 	cache := flag.Bool("cache", false, "Use DAQ-style message caching")
-	numChannels := flag.Int("channels", 4, "Number of ZMQ channels")
+	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")
 	flag.Parse()
 
 	fmt.Printf("Go Pub-Sub Producer v2.0 - Multi-Channel\n")
