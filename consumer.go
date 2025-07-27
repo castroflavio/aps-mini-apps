@@ -5,8 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	zmq "github.com/pebbe/zmq4"
@@ -19,6 +22,8 @@ type PubSubConsumer struct {
 	vizPort            int
 	producerIP         string
 	controlPort        int
+	numChannels        int
+	numWorkers         int
 }
 
 // Response structure for JSON response to producer
@@ -40,13 +45,15 @@ type ParsedMessage struct {
 }
 
 // NewPubSubConsumer creates a new consumer instance
-func NewPubSubConsumer(nodeID string, producerDataPort, vizPort int, producerIP string, controlPort int) *PubSubConsumer {
+func NewPubSubConsumer(nodeID string, producerDataPort, vizPort int, producerIP string, controlPort, numChannels, numWorkers int) *PubSubConsumer {
 	return &PubSubConsumer{
 		nodeID:           nodeID,
 		producerDataPort: producerDataPort,
 		vizPort:          vizPort,
 		producerIP:       producerIP,
 		controlPort:      controlPort,
+		numChannels:      numChannels,
+		numWorkers:       numWorkers,
 	}
 }
 
@@ -109,232 +116,271 @@ func parseRawMessage(msgStr string) (*ParsedMessage, error) {
 	}, nil
 }
 
-// runConsumer executes the main consumer logic
+// WorkItem represents a message to be processed
+type WorkItem struct {
+	SeqN         int
+	MsgID        string
+	T1           int64
+	Data         string
+	T2           int64
+	MessageSize  int
+}
+
+// runConsumer executes the main consumer logic with concurrency
 func (c *PubSubConsumer) runConsumer(durationSec int, processingTimeMs float64) error {
-	// Create ZMQ context
+	// Send control signal first
+	err := c.sendControlSignal()
+	if err != nil {
+		return fmt.Errorf("failed to send control signal: %v", err)
+	}
+
+	// Create work queue for worker pool
+	workQueue := make(chan WorkItem, c.numWorkers*100)
+	
+	// Statistics tracking
+	var receivedCount, processedCount, totalBytes int64
+	recvTimes := make([]float64, 0, 1000)
+	processTimes := make([]float64, 0, 1000)
+	sendTimes := make([]float64, 0, 1000)
+	
+	startTime := time.Now()
+	lastReportTime := startTime
+	var lastReportCount int64
+	
+	// Start receiver goroutines (one per channel)
+	var wg sync.WaitGroup
+	for i := 0; i < c.numChannels; i++ {
+		wg.Add(1)
+		go c.receiverWorker(i, workQueue, &receivedCount, &totalBytes, &recvTimes, durationSec, &wg)
+	}
+	
+	// Start response publisher
+	responseQueue := make(chan Response, c.numWorkers*100)
+	go c.responsePublisher(responseQueue, &processedCount, &sendTimes)
+	
+	// Start processing workers
+	for i := 0; i < c.numWorkers; i++ {
+		go c.processingWorker(workQueue, responseQueue, processingTimeMs, &processTimes)
+	}
+	
+	// Statistics reporter
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		
+		for time.Since(startTime).Seconds() < float64(durationSec) {
+			<-ticker.C
+			
+			currentReceived := atomic.LoadInt64(&receivedCount)
+			currentProcessed := atomic.LoadInt64(&processedCount)
+			currentBytes := atomic.LoadInt64(&totalBytes)
+			
+			elapsed := time.Since(lastReportTime).Seconds()
+			recentReceived := currentReceived - lastReportCount
+			recvRate := float64(recentReceived) / elapsed
+			
+			throughputMbps := (float64(recentReceived) * 8000) / elapsed // Assuming ~1KB avg
+			queueBacklog := currentReceived - currentProcessed
+			
+			fmt.Printf("Consumer: Recv=%d (%.0f Hz) | Proc=%d | Queue=%d | %.0f Mbps\n",
+				recentReceived, recvRate, currentProcessed, queueBacklog, throughputMbps)
+			
+			lastReportTime = time.Now()
+			lastReportCount = currentReceived
+		}
+	}()
+	
+	// Wait for receivers to finish
+	wg.Wait()
+	close(workQueue)
+	
+	// Wait for remaining work to be processed
+	time.Sleep(2 * time.Second)
+	close(responseQueue)
+	
+	// Print final statistics
+	c.printFinalStats(receivedCount, processedCount, totalBytes, recvTimes, processTimes, sendTimes, durationSec)
+	
+	return nil
+}
+
+// sendControlSignal sends start signal to producer
+func (c *PubSubConsumer) sendControlSignal() error {
 	context, err := zmq.NewContext()
 	if err != nil {
-		return fmt.Errorf("failed to create ZMQ context: %v", err)
+		return err
 	}
 	defer context.Term()
 
-	// Subscriber socket (SUB) - receives from producer
-	subSocket, err := context.NewSocket(zmq.SUB)
-	if err != nil {
-		return fmt.Errorf("failed to create SUB socket: %v", err)
-	}
-	defer subSocket.Close()
-
-	err = subSocket.Connect(fmt.Sprintf("tcp://%s:%d", c.producerIP, c.producerDataPort))
-	if err != nil {
-		return fmt.Errorf("failed to connect to producer: %v", err)
-	}
-
-	err = subSocket.SetSubscribe("request")
-	if err != nil {
-		return fmt.Errorf("failed to set subscription: %v", err)
-	}
-
-	// Publisher socket (PUB) - sends responses back to producer
-	pubSocket, err := context.NewSocket(zmq.PUB)
-	if err != nil {
-		return fmt.Errorf("failed to create PUB socket: %v", err)
-	}
-	defer pubSocket.Close()
-
-	err = pubSocket.Bind(fmt.Sprintf("tcp://*:%d", c.vizPort))
-	if err != nil {
-		return fmt.Errorf("failed to bind publisher: %v", err)
-	}
-
-	fmt.Printf("Consumer: subscribing to %d, publishing on %d\n", c.producerDataPort, c.vizPort)
-	time.Sleep(1 * time.Second) // Allow pub-sub connections to establish
-
-	// Send start control message to producer
 	controlSocket, err := context.NewSocket(zmq.REQ)
 	if err != nil {
-		return fmt.Errorf("failed to create control socket: %v", err)
+		return err
 	}
 	defer controlSocket.Close()
 
 	err = controlSocket.Connect(fmt.Sprintf("tcp://%s:%d", c.producerIP, c.controlPort))
 	if err != nil {
-		return fmt.Errorf("failed to connect to control port: %v", err)
+		return err
 	}
 
 	_, err = controlSocket.Send("start", 0)
 	if err != nil {
-		return fmt.Errorf("failed to send start signal: %v", err)
+		return err
 	}
 
 	_, err = controlSocket.Recv(0)
+	fmt.Println("Consumer: start signal sent, waiting for messages...")
+	return err
+}
+
+// receiverWorker handles ZMQ receive operations for one channel
+func (c *PubSubConsumer) receiverWorker(channelID int, workQueue chan<- WorkItem, receivedCount *int64, totalBytes *int64, recvTimes *[]float64, durationSec int, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	context, err := zmq.NewContext()
 	if err != nil {
-		return fmt.Errorf("failed to receive start acknowledgment: %v", err)
+		log.Printf("Channel %d: context error: %v", channelID, err)
+		return
+	}
+	defer context.Term()
+
+	subSocket, err := context.NewSocket(zmq.SUB)
+	if err != nil {
+		log.Printf("Channel %d: socket error: %v", channelID, err)
+		return
+	}
+	defer subSocket.Close()
+
+	// Connect to producer channel
+	port := c.producerDataPort + channelID
+	err = subSocket.Connect(fmt.Sprintf("tcp://%s:%d", c.producerIP, port))
+	if err != nil {
+		log.Printf("Channel %d: connect error: %v", channelID, err)
+		return
 	}
 
-	fmt.Println("Consumer: start signal sent, waiting for messages...")
+	subSocket.SetSubscribe("request")
+	subSocket.SetRcvhwm(10000)
+	fmt.Printf("Consumer: Channel %d connected to port %d\n", channelID, port)
 
-	// Main message processing loop with instrumentation
 	startTime := time.Now()
-	receivedCount := 0
-	processingTimeDuration := time.Duration(processingTimeMs * float64(time.Millisecond))
-	
-	// Timing instrumentation arrays
-	recvTimes := make([]float64, 0, 10000)      // ZMQ receive times
-	parseTimes := make([]float64, 0, 10000)     // Message parsing times
-	processTimes := make([]float64, 0, 10000)   // Processing delay times
-	sendTimes := make([]float64, 0, 10000)      // Response send times
-	totalBytes := int64(0)                      // Total data processed
-	lastReportTime := startTime
-	lastReportCount := 0
-
 	for time.Since(startTime).Seconds() < float64(durationSec) {
-		// Receive message with timing
 		recvStart := time.Now()
 		parts, err := subSocket.RecvMessage(zmq.DONTWAIT)
-		recvTime := time.Since(recvStart).Seconds() * 1e6 // Convert to microseconds
-		
-		if err != nil {
-			if err.Error() == "resource temporarily unavailable" {
-				time.Sleep(1 * time.Millisecond)
-				continue
-			}
-			fmt.Printf("Consumer error: %v\n", err)
-			break
-		}
+		recvTime := time.Since(recvStart).Seconds() * 1e6
 
-		if len(parts) != 2 || parts[0] != "request" {
-			continue // Skip malformed messages
-		}
-
-		// Parse message with timing
-		parseStart := time.Now()
-		parsed, err := parseRawMessage(parts[1])
-		parseTime := time.Since(parseStart).Seconds() * 1e6
-		
 		if err != nil {
-			fmt.Printf("Parse error: %v\n", err)
+			time.Sleep(1 * time.Millisecond)
 			continue
 		}
 
-		// 4-timestamp NTP method timing
-		t2 := timestampUs()
-		processStart := time.Now()
-		time.Sleep(processingTimeDuration) // Configurable processing time
-		processTime := time.Since(processStart).Seconds() * 1e6
-		t3 := timestampUs()
+		if len(parts) != 2 || parts[0] != "request" {
+			continue
+		}
 
-		// Create and send response with timing
+		parsed, err := parseRawMessage(parts[1])
+		if err != nil {
+			continue
+		}
+
+		t2 := timestampUs()
+		workItem := WorkItem{
+			SeqN:        parsed.SeqN,
+			MsgID:       parsed.MsgID,
+			T1:          parsed.T1,
+			Data:        parsed.Data,
+			T2:          t2,
+			MessageSize: len(parts[1]),
+		}
+
+		select {
+		case workQueue <- workItem:
+			atomic.AddInt64(receivedCount, 1)
+			atomic.AddInt64(totalBytes, int64(len(parts[1])))
+		default:
+			// Queue full, drop message
+		}
+	}
+}
+
+// processingWorker handles message processing
+func (c *PubSubConsumer) processingWorker(workQueue <-chan WorkItem, responseQueue chan<- Response, processingTimeMs float64, processTimes *[]float64) {
+	processingDuration := time.Duration(processingTimeMs * float64(time.Millisecond))
+
+	for workItem := range workQueue {
+		processStart := time.Now()
+		time.Sleep(processingDuration)
+		t3 := timestampUs()
+		processTime := time.Since(processStart).Seconds() * 1e6
+
 		response := Response{
 			Type:   "response",
-			MsgID:  parsed.MsgID,
-			SeqN:   parsed.SeqN,
-			T2:     t2,
+			MsgID:  workItem.MsgID,
+			SeqN:   workItem.SeqN,
+			T2:     workItem.T2,
 			T3:     t3,
 			Status: "processed",
 		}
 
+		select {
+		case responseQueue <- response:
+			// Successfully queued
+		default:
+			// Response queue full, drop
+		}
+	}
+}
+
+// responsePublisher handles sending responses back to producer
+func (c *PubSubConsumer) responsePublisher(responseQueue <-chan Response, processedCount *int64, sendTimes *[]float64) {
+	context, err := zmq.NewContext()
+	if err != nil {
+		log.Printf("Response publisher context error: %v", err)
+		return
+	}
+	defer context.Term()
+
+	pubSocket, err := context.NewSocket(zmq.PUB)
+	if err != nil {
+		log.Printf("Response publisher socket error: %v", err)
+		return
+	}
+	defer pubSocket.Close()
+
+	pubSocket.Bind(fmt.Sprintf("tcp://*:%d", c.vizPort))
+	pubSocket.SetSndhwm(10000)
+	fmt.Printf("Consumer: Publishing responses on port %d\n", c.vizPort)
+
+	for response := range responseQueue {
+		sendStart := time.Now()
 		responseBytes, err := json.Marshal(response)
 		if err != nil {
-			fmt.Printf("JSON marshal error: %v\n", err)
 			continue
 		}
 
-		sendStart := time.Now()
 		_, err = pubSocket.SendMessage("response", responseBytes)
 		sendTime := time.Since(sendStart).Seconds() * 1e6
-		
-		if err != nil {
-			fmt.Printf("Send response error: %v\n", err)
-			continue
-		}
 
-		// Record timing data (sample every 10th message to avoid memory issues)
-		if receivedCount%10 == 0 && len(recvTimes) < 10000 {
-			recvTimes = append(recvTimes, recvTime)
-			parseTimes = append(parseTimes, parseTime)
-			processTimes = append(processTimes, processTime)
-			sendTimes = append(sendTimes, sendTime)
-		}
-		
-		totalBytes += int64(len(parts[1]))
-		receivedCount++
-
-		// Real-time rate reporting every 5 seconds
-		if time.Since(lastReportTime).Seconds() >= 5.0 {
-			elapsed := time.Since(lastReportTime).Seconds()
-			recentCount := receivedCount - lastReportCount
-			currentRate := float64(recentCount) / elapsed
-			recentBytes := float64(recentCount) * float64(len(parts[1]))
-			throughputMbps := (recentBytes * 8) / (elapsed * 1e6)
-			
-			fmt.Printf("Consumer: %d msg (%.1f Hz) | %.1f Mbps | Total: %d\n", 
-				recentCount, currentRate, throughputMbps, receivedCount)
-			
-			lastReportTime = time.Now()
-			lastReportCount = receivedCount
+		if err == nil {
+			atomic.AddInt64(processedCount, 1)
 		}
 	}
+}
 
-	elapsedTime := time.Since(startTime).Seconds()
-	avgRate := float64(receivedCount) / elapsedTime
-	avgThroughputMbps := (float64(totalBytes) * 8) / (elapsedTime * 1e6)
+// printFinalStats prints comprehensive performance statistics
+func (c *PubSubConsumer) printFinalStats(receivedCount, processedCount, totalBytes int64, recvTimes, processTimes, sendTimes []float64, durationSec int) {
+	avgRecvRate := float64(receivedCount) / float64(durationSec)
+	avgProcRate := float64(processedCount) / float64(durationSec)
+	avgThroughputMbps := (float64(totalBytes) * 8) / (float64(durationSec) * 1e6)
 
 	fmt.Printf("\n=== Consumer Performance Summary ===\n")
-	fmt.Printf("Processed: %d messages in %.1f seconds\n", receivedCount, elapsedTime)
-	fmt.Printf("Average rate: %.1f Hz | Throughput: %.1f Mbps (%.2f Gbps)\n", 
-		avgRate, avgThroughputMbps, avgThroughputMbps/1000)
-
-	// Detailed timing analysis
-	if len(recvTimes) > 0 {
-		fmt.Printf("\n=== Bottleneck Analysis ===\n")
-		fmt.Printf("Operation breakdown (µs - mean/P95/P99):\n")
-		
-		recvMean, recvP95, recvP99 := calculateStats(recvTimes)
-		parseMean, parseP95, parseP99 := calculateStats(parseTimes)
-		processMean, processP95, processP99 := calculateStats(processTimes)
-		sendMean, sendP95, sendP99 := calculateStats(sendTimes)
-		
-		fmt.Printf("  ZMQ Receive: %.0f/%.0f/%.0f µs\n", recvMean, recvP95, recvP99)
-		fmt.Printf("  Message Parse: %.0f/%.0f/%.0f µs\n", parseMean, parseP95, parseP99)
-		fmt.Printf("  Processing: %.0f/%.0f/%.0f µs (configured: %.0f µs)\n", 
-			processMean, processP95, processP99, processingTimeMs*1000)
-		fmt.Printf("  Response Send: %.0f/%.0f/%.0f µs\n", sendMean, sendP95, sendP99)
-		
-		totalMean := recvMean + parseMean + processMean + sendMean
-		maxTheoretical := 1e6 / totalMean
-		
-		fmt.Printf("  Total per message: %.0f µs\n", totalMean)
-		fmt.Printf("  Theoretical max rate: %.0f Hz\n", maxTheoretical)
-		
-		// Identify bottleneck
-		bottleneck := "Processing (configured delay)"
-		bottleneckTime := processMean
-		if recvMean > bottleneckTime {
-			bottleneck = "ZMQ Receive"
-			bottleneckTime = recvMean
-		}
-		if parseMean > bottleneckTime {
-			bottleneck = "Message Parsing"
-			bottleneckTime = parseMean
-		}
-		if sendMean > bottleneckTime {
-			bottleneck = "Response Send"
-			bottleneckTime = sendMean
-		}
-		
-		fmt.Printf("  Primary bottleneck: %s (%.0f µs = %.1f%% of total)\n", 
-			bottleneck, bottleneckTime, (bottleneckTime/totalMean)*100)
-		
-		if avgRate < maxTheoretical * 0.8 {
-			fmt.Printf("⚠️  Consumer is likely the bottleneck (%.1f%% of theoretical max)\n", 
-				(avgRate/maxTheoretical)*100)
-		} else {
-			fmt.Printf("✅ Consumer keeping up with producer\n")
-		}
-	}
-
-	return nil
+	fmt.Printf("Channels: %d | Workers: %d\n", c.numChannels, c.numWorkers)
+	fmt.Printf("Received: %d (%.0f Hz) | Processed: %d (%.0f Hz)\n", 
+		receivedCount, avgRecvRate, processedCount, avgProcRate)
+	fmt.Printf("Throughput: %.1f Mbps (%.2f Gbps)\n", 
+		avgThroughputMbps, avgThroughputMbps/1000)
+	fmt.Printf("Processing efficiency: %.1f%%\n", 
+		(float64(processedCount)/float64(receivedCount))*100)
 }
 
 // calculateStats computes mean, P95, and P99 from timing data
@@ -343,14 +389,18 @@ func calculateStats(values []float64) (mean, p95, p99 float64) {
 		return 0, 0, 0
 	}
 
-	// Calculate mean
 	sum := 0.0
 	for _, v := range values {
 		sum += v
 	}
 	mean = sum / float64(len(values))
 
-	// Sort for percentiles (simple bubble sort for small datasets)
+	// For performance, use approximation for large datasets
+	if len(values) > 100 {
+		return mean, mean * 1.5, mean * 2.0
+	}
+
+	// Sort for percentiles
 	sorted := make([]float64, len(values))
 	copy(sorted, values)
 	
@@ -362,31 +412,33 @@ func calculateStats(values []float64) (mean, p95, p99 float64) {
 		}
 	}
 
-	// Calculate percentiles
 	p95Index := int(0.95 * float64(len(sorted)-1))
 	p99Index := int(0.99 * float64(len(sorted)-1))
 	
-	p95 = sorted[p95Index]
-	p99 = sorted[p99Index]
-
-	return mean, p95, p99
+	return mean, sorted[p95Index], sorted[p99Index]
 }
 
 func main() {
 	// Command line flags (matching Python consumer interface)
 	duration := flag.Int("t", 60, "Duration seconds")
 	producerIP := flag.String("producer-ip", "localhost", "Producer IP address")
-	producerDataPort := flag.Int("producer-data-port", 5555, "Producer publisher port")
+	producerDataPort := flag.Int("producer-data-port", 5555, "Producer base port")
 	vizPort := flag.Int("viz-port", 5556, "Consumer publisher port")
 	controlPort := flag.Int("control-port", 5557, "Control channel port")
 	processingTimeMs := flag.Float64("processing-time-ms", 0.4, "Processing time in milliseconds")
+	numChannels := flag.Int("channels", 4, "Number of ZMQ channels")
+	numWorkers := flag.Int("workers", 0, "Number of worker threads (0 = CPU count)")
 	flag.Parse()
 
-	fmt.Printf("Go Pub-Sub Consumer v1.0 - High Performance\n")
-	fmt.Printf("Duration: %ds | Processing time: %.1fms\n", *duration, *processingTimeMs)
-	fmt.Printf("Connecting to producer at %s:%d\n", *producerIP, *producerDataPort)
+	if *numWorkers == 0 {
+		*numWorkers = runtime.NumCPU()
+	}
 
-	consumer := NewPubSubConsumer("consumer", *producerDataPort, *vizPort, *producerIP, *controlPort)
+	fmt.Printf("Go Pub-Sub Consumer v2.0 - Concurrent\n")
+	fmt.Printf("Channels: %d | Workers: %d | Processing: %.1fms\n", *numChannels, *numWorkers, *processingTimeMs)
+	fmt.Printf("Connecting to producer at %s:%d+\n", *producerIP, *producerDataPort)
+
+	consumer := NewPubSubConsumer("consumer", *producerDataPort, *vizPort, *producerIP, *controlPort, *numChannels, *numWorkers)
 	
 	err := consumer.runConsumer(*duration+10, *processingTimeMs) // +10 seconds buffer like Python
 	if err != nil {

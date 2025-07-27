@@ -34,6 +34,7 @@ type PubSubProducer struct {
 	vizPort         int
 	vizIP           string
 	controlPort     int
+	numChannels     int
 	measurements    []Measurement
 	pendingMessages map[string]PendingMessage
 	mu              sync.RWMutex
@@ -58,13 +59,14 @@ type Response struct {
 }
 
 // NewPubSubProducer creates a new producer instance
-func NewPubSubProducer(nodeID string, dataPort, vizPort int, vizIP string, controlPort int) *PubSubProducer {
+func NewPubSubProducer(nodeID string, dataPort, vizPort int, vizIP string, controlPort, numChannels int) *PubSubProducer {
 	return &PubSubProducer{
 		nodeID:          nodeID,
 		dataPort:        dataPort,
 		vizPort:         vizPort,
 		vizIP:           vizIP,
 		controlPort:     controlPort,
+		numChannels:     numChannels,
 		measurements:    make([]Measurement, 0),
 		pendingMessages: make(map[string]PendingMessage),
 	}
@@ -170,7 +172,7 @@ func findTimestampOffset(message []byte) int {
 }
 
 // setupNetworking initializes ZMQ sockets and network monitoring
-func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.Socket, *zmq.Socket, *zmq.Socket, *exec.Cmd, string, error) {
+func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.Socket, []*zmq.Socket, *zmq.Socket, *exec.Cmd, string, error) {
 	// Control socket (REP)
 	controlSocket, err := zmq.NewSocket(zmq.REP)
 	if err != nil {
@@ -181,18 +183,33 @@ func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.So
 		return nil, nil, nil, nil, "", err
 	}
 
-	// Publisher socket (PUB)
-	pubSocket, err := zmq.NewSocket(zmq.PUB)
-	if err != nil {
-		return nil, nil, nil, nil, "", err
-	}
-	err = pubSocket.SetSndhwm(1000)
-	if err != nil {
-		return nil, nil, nil, nil, "", err
-	}
-	err = pubSocket.Bind(fmt.Sprintf("tcp://*:%d", p.dataPort))
-	if err != nil {
-		return nil, nil, nil, nil, "", err
+	// Create multiple publisher sockets (one per channel)
+	pubSockets := make([]*zmq.Socket, p.numChannels)
+	for i := 0; i < p.numChannels; i++ {
+		pubSocket, err := zmq.NewSocket(zmq.PUB)
+		if err != nil {
+			// Cleanup previously created sockets
+			for j := 0; j < i; j++ {
+				pubSockets[j].Close()
+			}
+			return nil, nil, nil, nil, "", err
+		}
+		
+		err = pubSocket.SetSndhwm(10000)
+		if err != nil {
+			pubSocket.Close()
+			return nil, nil, nil, nil, "", err
+		}
+		
+		port := p.dataPort + i
+		err = pubSocket.Bind(fmt.Sprintf("tcp://*:%d", port))
+		if err != nil {
+			pubSocket.Close()
+			return nil, nil, nil, nil, "", err
+		}
+		
+		pubSockets[i] = pubSocket
+		fmt.Printf("Producer: Channel %d bound to port %d\n", i, port)
 	}
 
 	// Visualization socket (SUB)
@@ -219,7 +236,7 @@ func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.So
 	monitorProc.Start()
 
 	time.Sleep(200 * time.Millisecond)
-	return controlSocket, pubSocket, vizSocket, monitorProc, networkCSV, nil
+	return controlSocket, pubSockets, vizSocket, monitorProc, networkCSV, nil
 }
 
 // waitForConsumer waits for consumer ready signal
@@ -246,7 +263,7 @@ func updateTimestampOptimized(message []byte, timestampOffset int, timestamp int
 }
 
 // streamMessages sends messages at specified rate with timing analysis
-func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages []MessageTemplate, 
+func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessages []MessageTemplate, 
 	rateHz float64, durationSec int, msgSize int) map[string]interface{} {
 	
 	startTime := time.Now()
@@ -282,8 +299,9 @@ func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages 
 		}
 		p.mu.Unlock()
 		
-		// Send message (non-blocking) - using template data directly
-		_, err := pubSocket.SendMessage("request", template.Data)
+		// Send message on distributed channel - using template data directly
+		channelID := seqN % len(pubSockets)
+		_, err := pubSockets[channelID].SendMessage("request", template.Data)
 		if err != nil {
 			skipped++
 			p.mu.Lock()
@@ -412,12 +430,18 @@ func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, rateHz float64, msgSi
 
 // runProducer executes the main producer logic
 func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string, useCache bool) (string, error) {
-	controlSocket, pubSocket, vizSocket, monitorProc, networkCSV, err := p.setupNetworking(iface, durationSec)
+	controlSocket, pubSockets, vizSocket, monitorProc, networkCSV, err := p.setupNetworking(iface, durationSec)
 	if err != nil {
 		return "", err
 	}
-	defer pubSocket.Close()
-	defer vizSocket.Close()
+	
+	// Cleanup all sockets
+	defer func() {
+		for _, socket := range pubSockets {
+			socket.Close()
+		}
+		vizSocket.Close()
+	}()
 
 	totalMessages := int(rateHz * float64(durationSec))
 	preparedMessages := p.prepareMessages(totalMessages, msgSize, rateHz, useCache)
@@ -428,7 +452,7 @@ func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, i
 	}
 	
 	p.streamingStarted = true
-	results := p.streamMessages(pubSocket, preparedMessages, rateHz, durationSec, msgSize)
+	results := p.streamMessages(pubSockets, preparedMessages, rateHz, durationSec, msgSize)
 	p.analyzePerformance(results, rateHz, msgSize, preparedMessages)
 	
 	time.Sleep(5 * time.Second)
@@ -480,12 +504,13 @@ func main() {
 	iface := flag.String("i", "lo0", "Network interface for monitoring")
 	output := flag.String("output", "producer_results.csv", "Output CSV filename")
 	cache := flag.Bool("cache", false, "Use DAQ-style message caching")
+	numChannels := flag.Int("channels", 4, "Number of ZMQ channels")
 	flag.Parse()
 
-	fmt.Printf("Go Pub-Sub Producer v1.0 - High Performance\n")
-	fmt.Printf("Rate: %.1f Hz | Duration: %ds | Message Size: %d bytes\n", *rate, *duration, *msgSize)
+	fmt.Printf("Go Pub-Sub Producer v2.0 - Multi-Channel\n")
+	fmt.Printf("Channels: %d | Rate: %.1f Hz | Duration: %ds | Message Size: %d bytes\n", *numChannels, *rate, *duration, *msgSize)
 
-	producer := NewPubSubProducer("producer", *dataPort, *vizPort, *vizIP, *controlPort)
+	producer := NewPubSubProducer("producer", *dataPort, *vizPort, *vizIP, *controlPort, *numChannels)
 	networkCSV, err := producer.runProducer(*rate, *duration, *msgSize, *iface, *cache)
 	if err != nil {
 		log.Fatalf("Producer error: %v", err)
