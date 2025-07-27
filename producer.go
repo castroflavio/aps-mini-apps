@@ -92,8 +92,14 @@ func createMeasurement(seqN int, msgID string, t1, t2, t3, t4 int64, msgSize int
 	}
 }
 
+// MessageTemplate holds pre-allocated message with known timestamp offset
+type MessageTemplate struct {
+	Data            []byte
+	TimestampOffset int
+}
+
 // prepareMessages creates pre-allocated message templates with fixed-width timestamp slots
-func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int, rateHz float64, useCache bool) [][]byte {
+func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int, rateHz float64, useCache bool) []MessageTemplate {
 	dataPayload := strings.Repeat("x", msgSize)
 	
 	if useCache {
@@ -105,22 +111,27 @@ func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int, rateHz floa
 			var cached []string
 			if json.Unmarshal(data, &cached) == nil && len(cached) == totalMessages {
 				fmt.Printf("Loaded %d messages from cache: %s\n", totalMessages, cacheFile)
-				messages := make([][]byte, totalMessages)
+				messages := make([]MessageTemplate, totalMessages)
 				for i, msg := range cached {
-					messages[i] = []byte(msg)
+					msgBytes := []byte(msg)
+					// Calculate timestamp offset by finding "t1="
+					offset := findTimestampOffset(msgBytes)
+					messages[i] = MessageTemplate{Data: msgBytes, TimestampOffset: offset}
 				}
 				return messages
 			}
 		}
 		
 		// Cache miss - generate and save
-		messages := make([][]byte, totalMessages)
+		messages := make([]MessageTemplate, totalMessages)
 		cached := make([]string, totalMessages)
 		
 		for i := 0; i < totalMessages; i++ {
 			template := fmt.Sprintf("request|seq_n=%d|msg_id=%d|t1=%020d|data=%s", 
 				i, i, 0, dataPayload)
-			messages[i] = []byte(template)
+			msgBytes := []byte(template)
+			offset := findTimestampOffset(msgBytes)
+			messages[i] = MessageTemplate{Data: msgBytes, TimestampOffset: offset}
 			cached[i] = template
 		}
 		
@@ -133,16 +144,29 @@ func (p *PubSubProducer) prepareMessages(totalMessages, msgSize int, rateHz floa
 		return messages
 	} else {
 		// Non-cached approach - generate fresh messages
-		messages := make([][]byte, totalMessages)
+		messages := make([]MessageTemplate, totalMessages)
 		
 		for i := 0; i < totalMessages; i++ {
 			template := fmt.Sprintf("request|seq_n=%d|msg_id=%d|t1=%020d|data=%s", 
 				i, i, 0, dataPayload)
-			messages[i] = []byte(template)
+			msgBytes := []byte(template)
+			offset := findTimestampOffset(msgBytes)
+			messages[i] = MessageTemplate{Data: msgBytes, TimestampOffset: offset}
 		}
 		
 		return messages
 	}
+}
+
+// findTimestampOffset calculates the byte offset of the timestamp field once during preparation
+func findTimestampOffset(message []byte) int {
+	// Find "t1=" and return the offset of the timestamp data (after "t1=")
+	for i := 0; i < len(message)-23; i++ {
+		if string(message[i:i+3]) == "t1=" {
+			return i + 3 // Return offset after "t1="
+		}
+	}
+	return -1 // Not found
 }
 
 // setupNetworking initializes ZMQ sockets and network monitoring
@@ -212,22 +236,17 @@ func (p *PubSubProducer) waitForConsumer(controlSocket *zmq.Socket) error {
 	return nil
 }
 
-// updateTimestamp efficiently updates timestamp in pre-allocated message
-func updateTimestamp(message []byte, timestamp int64) {
+// updateTimestampOptimized updates timestamp using pre-calculated offset - O(1) operation
+func updateTimestampOptimized(message []byte, timestampOffset int, timestamp int64) {
+	// Pre-format timestamp as 20-digit string with leading zeros
 	timestampStr := fmt.Sprintf("%020d", timestamp)
-	timestampBytes := []byte(timestampStr)
 	
-	// Find t1= position and update the 20 bytes after it
-	for i := 0; i < len(message)-23; i++ {
-		if string(message[i:i+3]) == "t1=" {
-			copy(message[i+3:i+23], timestampBytes)
-			break
-		}
-	}
+	// Direct copy to known offset - O(1) instead of O(m)
+	copy(message[timestampOffset:timestampOffset+20], []byte(timestampStr))
 }
 
 // streamMessages sends messages at specified rate with timing analysis
-func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages [][]byte, 
+func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages []MessageTemplate, 
 	rateHz float64, durationSec int, msgSize int) map[string]interface{} {
 	
 	startTime := time.Now()
@@ -243,14 +262,13 @@ func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages 
 	for seqN < len(preparedMessages) && time.Since(startTime).Seconds() < float64(durationSec) {
 		msgID := strconv.Itoa(seqN)
 		t1 := timestampUs()
+		template := &preparedMessages[seqN]
 		
-		// Message preparation timing (equivalent to string concatenation in Python)
+		// Message preparation timing (now truly O(1) with direct indexing)
 		prepStart := time.Now()
 		
-		// Create a copy of the message template and update timestamp
-		message := make([]byte, len(preparedMessages[seqN]))
-		copy(message, preparedMessages[seqN])
-		updateTimestamp(message, t1)
+		// In-place timestamp update using pre-calculated offset - O(1)
+		updateTimestampOptimized(template.Data, template.TimestampOffset, t1)
 		
 		prepTime := time.Since(prepStart).Seconds() * 1e6 // Convert to microseconds
 		prepTimes = append(prepTimes, prepTime)
@@ -264,8 +282,8 @@ func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages 
 		}
 		p.mu.Unlock()
 		
-		// Send message (non-blocking)
-		_, err := pubSocket.SendMessage("request", message)
+		// Send message (non-blocking) - using template data directly
+		_, err := pubSocket.SendMessage("request", template.Data)
 		if err != nil {
 			skipped++
 			p.mu.Lock()
@@ -303,7 +321,7 @@ func (p *PubSubProducer) streamMessages(pubSocket *zmq.Socket, preparedMessages 
 }
 
 // analyzePerformance prints detailed performance statistics
-func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rateHz float64, msgSize int) {
+func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rateHz float64, msgSize int, preparedMessages []MessageTemplate) {
 	seqN := results["seq_n"].(int)
 	sentCount := results["sent_count"].(int) 
 	skipped := results["skipped"].(int)
@@ -411,7 +429,7 @@ func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, i
 	
 	p.streamingStarted = true
 	results := p.streamMessages(pubSocket, preparedMessages, rateHz, durationSec, msgSize)
-	p.analyzePerformance(results, rateHz, msgSize)
+	p.analyzePerformance(results, rateHz, msgSize, preparedMessages)
 	
 	time.Sleep(5 * time.Second)
 	monitorProc.Wait()
