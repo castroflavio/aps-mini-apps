@@ -46,12 +46,12 @@ class PubSubProducer:
         if self.measurements: pd.DataFrame(self.measurements).to_csv(filename, index=False)
     
     def analyze_network_csv(self, csv_file, rate_hz, msg_size):
-        df = pd.read_csv(csv_file)
-        data = df[df['tx_throughput_bps'] > rate_hz * msg_size * 0.8]
-        if len(data) > 1:
-            gbps = data['tx_throughput_bps'].values / 1e9
-            pps = data['tx_throughput_pps'].values
-            print(f"Network: {len(data)} samples, TX: {np.mean(gbps):.2f}±{np.std(gbps):.2f} Gbps, PPS: {np.mean(pps):.0f}±{np.std(pps):.0f}")
+        try:
+            subprocess.run(['python3', 'analyze_network.py', csv_file, '-r', str(rate_hz), '-s', str(msg_size)], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Network analysis failed: {e}")
+        except FileNotFoundError:
+            print("analyze_network.py script not found")
     
     def _prepare_messages(self, total_messages, msg_size, rate_hz, use_cache=False):
         """Prepare messages for sending - either cached or pre-generated"""
