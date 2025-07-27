@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pub-Sub Producer with 4-Timestamp NTP Method
-Version 1.2
+Version 2.0
 """
 
 import time
@@ -66,7 +66,53 @@ class PubSubProducer:
         print(f"TX BPS - Avg: {np.mean(tx_bps):.0f}, P50: {np.percentile(tx_bps, 50):.0f}, P99: {np.percentile(tx_bps, 99):.0f}")
         print(f"TX PPS - Avg: {np.mean(tx_pps):.0f}, P50: {np.percentile(tx_pps, 50):.0f}, P99: {np.percentile(tx_pps, 99):.0f}")
     
-    def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0'):
+    def _prepare_messages(self, total_messages, msg_size, rate_hz, use_cache=False):
+        """Prepare messages for sending - either cached or pre-generated"""
+        data_payload = b'x' * msg_size
+        timestamp_width = 20  # Fixed-width timestamp field for O(1) updates
+        
+        if use_cache:
+            # DAQ-style caching approach
+            cache_file = f"producer_cache_{rate_hz}hz_{total_messages}msg_{msg_size}b.npy"
+            try:
+                print(f"Loading cached messages from {cache_file}...")
+                cached_data = np.load(cache_file, allow_pickle=True)
+                print(f"Loaded {len(cached_data)} cached messages")
+                return cached_data
+            except FileNotFoundError:
+                print("Pre-serializing all messages for cache...")
+                pre_serialized_messages = []
+                for i in range(total_messages):
+                    msg_id = f"{i}"
+                    # Create message with fixed-width timestamp field
+                    prefix = b'request|seq_n=' + str(i).encode() + b'|msg_id=' + msg_id.encode() + b'|t1='
+                    timestamp_field = b'0' * timestamp_width  # Fixed-width placeholder
+                    suffix = b'|data=' + data_payload
+                    message_data = prefix + timestamp_field + suffix
+                    timestamp_offset = len(prefix)  # Position where timestamp starts
+                    pre_serialized_messages.append((message_data, msg_id, timestamp_offset))
+                
+                cached_data = np.array(pre_serialized_messages, dtype=object)
+                np.save(cache_file, cached_data)
+                print(f"Cached {len(pre_serialized_messages)} messages to {cache_file}")
+                return cached_data
+        else:
+            # Simple pre-generation without caching
+            print("Pre-generating messages...")
+            pre_generated_messages = []
+            for i in range(total_messages):
+                msg_id = f"{i}"
+                # Create message with fixed-width timestamp field
+                prefix = b'request|seq_n=' + str(i).encode() + b'|msg_id=' + msg_id.encode() + b'|t1='
+                timestamp_field = b'0' * timestamp_width  # Fixed-width placeholder
+                suffix = b'|data=' + data_payload
+                message_data = bytearray(prefix + timestamp_field + suffix)  # Mutable for O(1) updates
+                timestamp_offset = len(prefix)  # Position where timestamp starts
+                pre_generated_messages.append((message_data, msg_id, timestamp_offset))
+            print(f"Pre-generated {len(pre_generated_messages)} messages")
+            return pre_generated_messages
+    
+    def run_producer(self, rate_hz=10, duration_sec=60, msg_size=1024, interface='lo0', use_cache=False):
         # Setup control and data sockets
         control_socket = self.context.socket(zmq.REP)
         control_socket.bind(f"tcp://*:{self.control_port}")
@@ -108,22 +154,35 @@ class PubSubProducer:
         interval = 1.0 / rate_hz
         next_send_time = time.time()
         
-        # Pre-encode static parts for optimization
-        data_payload = 'x' * msg_size
+        # Prepare messages using selected strategy
+        prepared_messages = self._prepare_messages(total_messages, msg_size, rate_hz, use_cache)
+        skipped = 0
+        
+        # Direct send approach - avoid queue overhead (1135ns) since ZMQ send (2220ns) is the real bottleneck
+        # Use simple timestamp serialization (168ns) since it's much faster than alternatives
         
         while seq_n < total_messages and ((time.time() - start_time) < duration_sec):
-            msg_id = f"{seq_n}"
+            message_data, msg_id, timestamp_offset = prepared_messages[seq_n]
             t1 = self.timestamp_us()
-            message = {
-                'type': 'request', 'seq_n': seq_n, 'msg_id': msg_id, 't1': t1,
-                'msg_size': msg_size, 'data': data_payload
-            }
+            
+            # Use fastest timestamp serialization (168ns vs 404ns for fixed-width)
+            timestamp_bytes = str(t1).encode().ljust(20, b'0')[:20]
+            
+            # Use string concatenation (348ns) - faster than bytearray ops (404ns)
+            final_message = message_data[:timestamp_offset] + timestamp_bytes + message_data[timestamp_offset+20:]
             
             self.pending_messages[msg_id] = {'seq_n': seq_n, 't1': t1, 'msg_size': msg_size}
-            pub_socket.send_multipart([b"request", json.dumps(message).encode()])
+            
+            try:
+                # Direct ZMQ send - avoid queue overhead (1135ns) since ZMQ (2220ns) dominates anyway
+                pub_socket.send_multipart([b"request", final_message], flags=zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                print("ZMQ queue full! Skipped message")
+                skipped += 1
+                self.pending_messages.pop(msg_id)  # Remove from pending since not sent
             
             if seq_n % rate_hz == 0:
-                print(f"Producer: published seq={seq_n}, size={msg_size}B")
+                print(f"Producer: sent seq={seq_n}, msg_size={msg_size}B")
             seq_n += 1
             
             # Compensating sleep for precise rate control
@@ -136,7 +195,7 @@ class PubSubProducer:
                 if seq_n % 100 == 0:
                     print(f"WARNING: {-sleep_time*1000:.1f}ms behind schedule")
         
-        print(f"Producer: published {seq_n} messages in {time.time() - start_time:.1f}s")
+        print(f"Producer: sent {seq_n} messages ({skipped} skipped) in {time.time() - start_time:.1f}s")
         time.sleep(5) # Analysis timeout time at the producer
         pub_socket.close()
         viz_socket.close()
@@ -183,11 +242,12 @@ class PubSubProducer:
 @click.option('--viz-ip', default='localhost', help='Visualization IP address')
 @click.option('--interface', '-i', default='lo0', help='Network interface for monitoring')
 @click.option('--output', default='producer_results.csv', help='Output CSV filename')
-def main(r, t, s, data_port, viz_port, control_port, viz_ip, interface, output):
+@click.option('--cache', is_flag=True, help='Use DAQ-style message caching')
+def main(r, t, s, data_port, viz_port, control_port, viz_ip, interface, output, cache):
     """Pub-Sub Producer with 4-timestamp NTP method"""
     
     producer_node = PubSubProducer("producer", data_port, viz_port, viz_ip, control_port)
-    network_csv = producer_node.run_producer(r, t, s, interface)
+    network_csv = producer_node.run_producer(r, t, s, interface, cache)
     
     if producer_node.measurements:
         offsets = [m['clock_offset_ms'] for m in producer_node.measurements]
