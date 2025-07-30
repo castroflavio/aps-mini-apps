@@ -15,11 +15,12 @@ class IperfProducer:
         self.port = port
         self.interface = interface
         
-    def run_producer(self, duration):
-        # Start monitoring
+    def run_producer(self, total_size_gb):
+        # Start monitoring (estimate duration based on size)
+        estimated_duration = max(30, int(total_size_gb * 10))  # ~10 seconds per GB
         csv_file = f"network_producer_{int(time.time())}.csv"
         monitor = subprocess.Popen(['python3', 'network_throughput_monitor.py', 
-                                   '-i', self.interface, '-d', str(duration + 10), '-o', csv_file])
+                                   '-i', self.interface, '-d', str(estimated_duration), '-o', csv_file])
         
         # Start iperf server
         results_file = f"iperf_producer_{int(time.time())}.json"
@@ -28,6 +29,7 @@ class IperfProducer:
                                   '--logfile', results_file])
         
         print(f"Producer (server): {self.bind_ip}:{self.port}")
+        print(f"Expecting {total_size_gb:.1f} GB transfer")
         print(f"Monitoring: {csv_file}")
         print("Waiting for consumer connection...")
         
@@ -39,20 +41,25 @@ class IperfProducer:
         with open(results_file, 'r') as f:
             result = json.load(f)
         
-        self.analyze_results(result, csv_file)
+        self.analyze_results(result, csv_file, total_size_gb)
         
         # Cleanup
         monitor.terminate()
         return result
     
-    def analyze_results(self, result, csv_file):
+    def analyze_results(self, result, csv_file, expected_gb):
         print("\n=== Producer Results ===")
         
         sent = result['end']['sum_sent']
         recv = result['end']['sum_received']
+        duration = sent['seconds']
         
-        print(f"Sent: {sent['bytes']/1024/1024:.1f} MB - {sent['bits_per_second']/1e9:.2f} Gbps")
-        print(f"Received: {recv['bytes']/1024/1024:.1f} MB - {recv['bits_per_second']/1e9:.2f} Gbps")
+        sent_gb = sent['bytes'] / (1024**3)
+        recv_gb = recv['bytes'] / (1024**3)
+        
+        print(f"Sent: {sent_gb:.2f} GB in {duration:.1f}s - {sent['bits_per_second']/1e9:.2f} Gbps")
+        print(f"Received: {recv_gb:.2f} GB - {recv['bits_per_second']/1e9:.2f} Gbps")
+        print(f"Efficiency: {(sent_gb/expected_gb)*100:.1f}% of expected {expected_gb:.1f} GB")
         
         if 'retransmits' in sent and sent['retransmits'] > 0:
             print(f"Retransmits: {sent['retransmits']}")
@@ -67,12 +74,12 @@ class IperfProducer:
 @click.command()
 @click.option('--bind-ip', default='0.0.0.0')
 @click.option('--port', default=5201)
-@click.option('-t', default=60)
+@click.option('--size', default=1.0, help='Total size in GB')
 @click.option('-i', '--interface', default='lo0')
-def main(bind_ip, port, t, interface):
+def main(bind_ip, port, size, interface):
     """Iperf Producer (Server) - waits for connections"""
     producer = IperfProducer(bind_ip, port, interface)
-    producer.run_producer(t)
+    producer.run_producer(size)
 
 if __name__ == "__main__":
     main()
