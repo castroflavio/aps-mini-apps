@@ -8,6 +8,32 @@ import numpy as np
 import click
 from datetime import datetime
 
+def find_stream_boundaries(df, threshold_pct=0.15):
+    """
+    Find stream start and end using 15% threshold of maximum throughput
+    Returns: (start_idx, end_idx) or (None, None) if no stream found
+    """
+    # Use TX throughput for boundary detection
+    tx_gbps = df['tx_gbps'].values
+    
+    if len(tx_gbps) == 0 or tx_gbps.max() == 0:
+        return None, None
+    
+    max_throughput = tx_gbps.max()
+    threshold = max_throughput * threshold_pct
+    
+    # Find first point above threshold (stream start)
+    above_threshold = tx_gbps > threshold
+    
+    if not above_threshold.any():
+        return None, None
+    
+    # Find first and last indices above threshold
+    start_idx = np.argmax(above_threshold)  # First True index
+    end_idx = len(above_threshold) - 1 - np.argmax(above_threshold[::-1])  # Last True index
+    
+    return start_idx, end_idx
+
 def analyze_network_counters(csv_file, expected_gbps=None):
     """Analyze network counter CSV data"""
     
@@ -60,6 +86,10 @@ def analyze_network_counters(csv_file, expected_gbps=None):
             print("No valid throughput data found")
             return
         
+        # Find stream boundaries using 15% threshold
+        stream_start_idx, stream_end_idx = find_stream_boundaries(valid_data)
+        stream_data = valid_data.iloc[stream_start_idx:stream_end_idx+1] if stream_start_idx is not None else valid_data
+        
         # Overall statistics
         total_duration = df['elapsed'].iloc[-1]
         total_sent_gb = (df['bytes_sent'].iloc[-1] - df['bytes_sent'].iloc[0]) / 1e9
@@ -69,9 +99,19 @@ def analyze_network_counters(csv_file, expected_gbps=None):
         print(f"Duration: {total_duration:.1f}s | Samples: {len(df)}")
         print(f"Total TX: {total_sent_gb:.2f} GB | Total RX: {total_recv_gb:.2f} GB")
         
-        # Throughput statistics (only non-zero values)
-        tx_nonzero = valid_data[valid_data['tx_gbps'] > 0]['tx_gbps']
-        rx_nonzero = valid_data[valid_data['rx_gbps'] > 0]['rx_gbps']
+        # Stream boundary information
+        if stream_start_idx is not None:
+            stream_start_time = valid_data.iloc[stream_start_idx]['elapsed']
+            stream_end_time = valid_data.iloc[stream_end_idx]['elapsed']
+            stream_duration = stream_end_time - stream_start_time
+            stream_sent_gb = (valid_data.iloc[stream_end_idx]['bytes_sent'] - valid_data.iloc[stream_start_idx]['bytes_sent']) / 1e9
+            
+            print(f"Stream: {stream_start_time:.1f}s to {stream_end_time:.1f}s ({stream_duration:.1f}s active)")
+            print(f"Stream TX: {stream_sent_gb:.2f} GB")
+        
+        # Throughput statistics using stream data
+        tx_nonzero = stream_data[stream_data['tx_gbps'] > 0]['tx_gbps']
+        rx_nonzero = stream_data[stream_data['rx_gbps'] > 0]['rx_gbps']
         
         if len(tx_nonzero) > 0:
             tx_mean = tx_nonzero.mean()
@@ -91,18 +131,18 @@ def analyze_network_counters(csv_file, expected_gbps=None):
             
             print(f"RX Throughput: Avg={rx_mean:.2f} Gbps, Max={rx_max:.2f} Gbps, Std={rx_std:.2f}")
         
-        # Peak activity periods
-        peak_tx_idx = valid_data['tx_gbps'].idxmax() if len(tx_nonzero) > 0 else None
-        peak_rx_idx = valid_data['rx_gbps'].idxmax() if len(rx_nonzero) > 0 else None
+        # Peak activity periods (from stream data)
+        peak_tx_idx = stream_data['tx_gbps'].idxmax() if len(tx_nonzero) > 0 else None
+        peak_rx_idx = stream_data['rx_gbps'].idxmax() if len(rx_nonzero) > 0 else None
         
         if peak_tx_idx is not None:
-            peak_time = valid_data.loc[peak_tx_idx, 'elapsed']
-            peak_value = valid_data.loc[peak_tx_idx, 'tx_gbps']
+            peak_time = stream_data.loc[peak_tx_idx, 'elapsed']
+            peak_value = stream_data.loc[peak_tx_idx, 'tx_gbps']
             print(f"Peak TX: {peak_value:.2f} Gbps at {peak_time:.1f}s")
         
         if peak_rx_idx is not None:
-            peak_time = valid_data.loc[peak_rx_idx, 'elapsed']
-            peak_value = valid_data.loc[peak_rx_idx, 'rx_gbps']
+            peak_time = stream_data.loc[peak_rx_idx, 'elapsed']
+            peak_value = stream_data.loc[peak_rx_idx, 'rx_gbps']
             print(f"Peak RX: {peak_value:.2f} Gbps at {peak_time:.1f}s")
         
         # Error summary

@@ -349,7 +349,7 @@ func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessag
 }
 
 // analyzePerformance prints detailed performance statistics
-func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rateHz float64, msgSize int, preparedMessages []MessageTemplate) {
+func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rateHz float64, msgSize int, preparedMessages []MessageTemplate, debug bool) {
 	seqN := results["seq_n"].(int)
 	sentCount := results["sent_count"].(int) 
 	skipped := results["skipped"].(int)
@@ -358,14 +358,14 @@ func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rate
 	
 	throughputGbps := float64(sentCount*msgSize*8) / (elapsedTime * 1e9)
 	
-	fmt.Printf("\n=== Producer Summary ===\n")
+	fmt.Printf("\n=== Process Results ===\n")
 	fmt.Printf("Messages: %d/%d sent (%d skipped = %.1f%%)\n", 
 		sentCount, seqN, skipped, float64(skipped)/float64(seqN)*100)
 	fmt.Printf("Rate: %.1f Hz (target: %.1f Hz) | Throughput: %.2f Gbps\n", 
 		float64(sentCount)/elapsedTime, rateHz, throughputGbps)
 	
-	// Statistical analysis of preparation times
-	if len(prepTimes) > 0 {
+	// Statistical analysis of preparation times (only in debug mode)
+	if debug && len(prepTimes) > 0 {
 		meanUs := mean(prepTimes)
 		p70Us := percentile(prepTimes, 70)
 		p99Us := percentile(prepTimes, 99)
@@ -438,7 +438,7 @@ func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, expectedGbps float64)
 }
 
 // runProducer executes the main producer logic
-func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string, useCache bool) (string, error) {
+func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, iface string, useCache, debug bool) (string, error) {
 	controlSocket, pubSockets, vizSocket, monitorProc, networkCSV, err := p.setupNetworking(iface, durationSec)
 	if err != nil {
 		return "", err
@@ -462,7 +462,7 @@ func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, i
 	
 	p.streamingStarted = true
 	results := p.streamMessages(pubSockets, preparedMessages, rateHz, durationSec, msgSize)
-	p.analyzePerformance(results, rateHz, msgSize, preparedMessages)
+	p.analyzePerformance(results, rateHz, msgSize, preparedMessages, debug)
 	
 	time.Sleep(5 * time.Second)
 	monitorProc.Wait()
@@ -514,13 +514,14 @@ func main() {
 	output := flag.String("output", "producer_results.csv", "Output CSV filename")
 	cache := flag.Bool("cache", false, "Use DAQ-style message caching")
 	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")
+	debugFlag := flag.Bool("d", false, "Enable debug output")
 	flag.Parse()
 
 	fmt.Printf("Go Pub-Sub Producer v2.0 - Multi-Channel\n")
 	fmt.Printf("Channels: %d | Rate: %.1f Hz | Duration: %ds | Message Size: %d bytes\n", *numChannels, *rate, *duration, *msgSize)
 
 	producer := NewPubSubProducer("producer", *dataPort, *vizPort, *vizIP, *controlPort, *numChannels)
-	networkCSV, err := producer.runProducer(*rate, *duration, *msgSize, *iface, *cache)
+	networkCSV, err := producer.runProducer(*rate, *duration, *msgSize, *iface, *cache, *debugFlag)
 	if err != nil {
 		log.Fatalf("Producer error: %v", err)
 	}
