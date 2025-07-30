@@ -16,8 +16,8 @@ class IperfProducer:
         self.interface = interface
         
     def run_producer(self, total_size_gb):
-        # Start monitoring (estimate duration based on size)
-        estimated_duration = max(30, int(total_size_gb * 10))  # ~10 seconds per GB
+        # Start monitoring (estimate duration: 5s buffer + ~10s per GB)
+        estimated_duration = 5 + max(30, int(total_size_gb * 10))
         csv_file = f"network_producer_{int(time.time())}.csv"
         monitor = subprocess.Popen(['python3', 'network_throughput_monitor.py', 
                                    '-i', self.interface, '-d', str(estimated_duration), '-o', csv_file])
@@ -35,11 +35,17 @@ class IperfProducer:
         print(f"Monitoring: {csv_file}")
         print("Waiting for consumer connection...")
         
-        # Wait for test completion
-        server.wait()
+        # Wait for test completion with timeout
+        timeout_seconds = estimated_duration
+        try:
+            server.wait(timeout=timeout_seconds)
+            print("Test completed, waiting for results file...")
+        except subprocess.TimeoutExpired:
+            print(f"Server timeout after {timeout_seconds}s, terminating...")
+            server.terminate()
+            server.wait()
         
         # Give iperf time to write the results file
-        print("Test completed, waiting for results file...")
         time.sleep(3)
         
         # Read and analyze results
@@ -57,21 +63,25 @@ class IperfProducer:
         
         sent = result['end']['sum_sent']
         recv = result['end']['sum_received']
-        duration = sent['seconds']
         
+        # Use actual duration from iperf logs
+        actual_duration = sent['seconds']
         sent_gb = sent['bytes'] / (1024**3)
         recv_gb = recv['bytes'] / (1024**3)
         
-        print(f"Sent: {sent_gb:.2f} GB in {duration:.1f}s - {sent['bits_per_second']/1e9:.2f} Gbps")
-        print(f"Received: {recv_gb:.2f} GB - {recv['bits_per_second']/1e9:.2f} Gbps")
+        # Calculate throughput using iperf's duration
+        actual_gbps = (sent['bytes'] * 8) / (actual_duration * 1e9)
+        
+        print(f"Sent: {sent_gb:.2f} GB in {actual_duration:.1f}s")
+        print(f"Received: {recv_gb:.2f} GB")
+        print(f"Throughput: {actual_gbps:.2f} Gbps (from iperf duration)")
         print(f"Efficiency: {(sent_gb/expected_gb)*100:.1f}% of expected {expected_gb:.1f} GB")
         
         if 'retransmits' in sent and sent['retransmits'] > 0:
             print(f"Retransmits: {sent['retransmits']}")
         
-        # Network analysis
-        gbps = sent['bits_per_second'] / 1e9
-        rate_hz = int((gbps * 1e9) / (1024 * 8))
+        # Network analysis using actual throughput
+        rate_hz = int((actual_gbps * 1e9) / (1024 * 8))
         subprocess.run(['python3', 'analyze_network.py', csv_file, '-r', str(rate_hz), '-s', '1024'])
         
         print(f"Data: {csv_file}")
@@ -79,7 +89,7 @@ class IperfProducer:
 @click.command()
 @click.option('--bind-ip', default='0.0.0.0')
 @click.option('--port', default=5201)
-@click.option('--size', default=1.0, help='Total size in GB')
+@click.option('--size', default=1.0, help='Expected size in GB (for monitoring duration)')
 @click.option('-i', '--interface', default='lo0')
 def main(bind_ip, port, size, interface):
     """Iperf Producer (Server) - waits for connections"""

@@ -53,21 +53,25 @@ class IperfConsumer:
         
         sent = result['end']['sum_sent']
         recv = result['end']['sum_received']
-        duration = sent['seconds']
         
+        # Use actual duration from iperf logs
+        actual_duration = sent['seconds']
         sent_gb = sent['bytes'] / (1024**3)
         recv_gb = recv['bytes'] / (1024**3)
         
-        print(f"Sent: {sent_gb:.2f} GB in {duration:.1f}s - {sent['bits_per_second']/1e9:.2f} Gbps")
-        print(f"Received: {recv_gb:.2f} GB - {recv['bits_per_second']/1e9:.2f} Gbps")
+        # Calculate throughput using iperf's duration
+        actual_gbps = (sent['bytes'] * 8) / (actual_duration * 1e9)
+        
+        print(f"Sent: {sent_gb:.2f} GB in {actual_duration:.1f}s")
+        print(f"Received: {recv_gb:.2f} GB")
+        print(f"Throughput: {actual_gbps:.2f} Gbps (from iperf duration)")
         print(f"Efficiency: {(sent_gb/expected_gb)*100:.1f}% of expected {expected_gb:.1f} GB")
         
         if 'retransmits' in sent and sent['retransmits'] > 0:
             print(f"Retransmits: {sent['retransmits']}")
         
-        # Network analysis
-        gbps = sent['bits_per_second'] / 1e9
-        rate_hz = int((gbps * 1e9) / (1024 * 8))
+        # Network analysis using actual throughput
+        rate_hz = int((actual_gbps * 1e9) / (1024 * 8))
         subprocess.run(['python3', 'analyze_network.py', csv_file, '-r', str(rate_hz), '-s', '1024'])
         
         print(f"Data: {csv_file}")
