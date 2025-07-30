@@ -241,7 +241,7 @@ func (p *PubSubProducer) setupNetworking(iface string, durationSec int) (*zmq.So
 
 	// Start network monitoring
 	networkCSV := fmt.Sprintf("network_%s_%d.csv", iface, time.Now().Unix())
-	monitorProc := exec.Command("python", "network_throughput_monitor.py", 
+	monitorProc := exec.Command("python3", "netmonitor.py", 
 		"-i", iface, "-d", strconv.Itoa(durationSec+10), "-o", networkCSV)
 	monitorProc.Start()
 
@@ -424,10 +424,9 @@ func (p *PubSubProducer) visualizationListener(vizSocket *zmq.Socket) {
 }
 
 // analyzeNetworkCSV calls the Python network analysis script
-func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, rateHz float64, msgSize int) {
-	cmd := exec.Command("python3", "analyze_network.py", csvFile, 
-		"-r", fmt.Sprintf("%.1f", rateHz), 
-		"-s", strconv.Itoa(msgSize))
+func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, expectedGbps float64) {
+	cmd := exec.Command("python3", "analyze_netmonitor.py", csvFile, 
+		"--expected-gbps", fmt.Sprintf("%.2f", expectedGbps))
 	
 	output, err := cmd.Output()
 	if err != nil {
@@ -559,6 +558,8 @@ func main() {
 	}
 
 	// Analyze network data using Python script
-	producer.analyzeNetworkCSV(networkCSV, *rate, *msgSize)
+	// Calculate expected Gbps from rate and message size
+	expectedGbps := (float64(*rate) * float64(*msgSize) * 8) / 1e9
+	producer.analyzeNetworkCSV(networkCSV, expectedGbps)
 	fmt.Printf("Network monitoring data: %s\n", networkCSV)
 }
