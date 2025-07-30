@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -274,7 +275,7 @@ func updateTimestampOptimized(message []byte, timestampOffset int, timestamp int
 
 // streamMessages sends messages at specified rate with timing analysis
 func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessages []MessageTemplate, 
-	rateHz float64, durationSec int, msgSize int) map[string]interface{} {
+	rateHz float64, durationSec int, msgSize int, debug bool) map[string]interface{} {
 	
 	startTime := time.Now()
 	interval := time.Duration(float64(time.Second) / rateHz)
@@ -285,22 +286,31 @@ func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessag
 	
 	// Timing arrays for statistical analysis
 	prepTimes := make([]float64, 0, len(preparedMessages))
+	sendTimes := make([]float64, 0, len(preparedMessages))
+	sleepTimes := make([]float64, 0, len(preparedMessages))
+	scheduleDelays := make([]float64, 0, len(preparedMessages))
 	
 	for seqN < len(preparedMessages) && time.Since(startTime).Seconds() < float64(durationSec) {
+		loopStart := time.Now()
 		msgID := strconv.Itoa(seqN)
 		t1 := timestampUs()
 		template := &preparedMessages[seqN]
 		
-		// Message preparation timing (now truly O(1) with direct indexing)
+		// Check scheduling accuracy
+		scheduleDelay := time.Since(nextSendTime).Seconds() * 1e6
+		if debug && scheduleDelay > 100 { // > 100μs delay
+			fmt.Printf("DEBUG [%d]: Schedule delay: %.0fμs\n", seqN, scheduleDelay)
+		}
+		scheduleDelays = append(scheduleDelays, scheduleDelay)
+		
+		// Message preparation timing
 		prepStart := time.Now()
-		
-		// In-place timestamp update using pre-calculated offset - O(1)
 		updateTimestampOptimized(template.Data, template.TimestampOffset, t1)
-		
-		prepTime := time.Since(prepStart).Seconds() * 1e6 // Convert to microseconds
+		prepTime := time.Since(prepStart).Seconds() * 1e6
 		prepTimes = append(prepTimes, prepTime)
 		
-		// Store pending message for response tracking
+		// Mutex timing
+		mutexStart := time.Now()
 		p.mu.Lock()
 		p.pendingMessages[msgID] = PendingMessage{
 			SeqN:    seqN,
@@ -308,16 +318,29 @@ func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessag
 			MsgSize: msgSize,
 		}
 		p.mu.Unlock()
+		mutexTime := time.Since(mutexStart).Seconds() * 1e6
 		
-		// Send message on distributed channel - using template data directly
+		if debug && mutexTime > 50 { // > 50μs mutex time
+			fmt.Printf("DEBUG [%d]: Mutex delay: %.0fμs\n", seqN, mutexTime)
+		}
+		
+		// ZMQ send timing
+		sendStart := time.Now()
 		channelID := seqN % len(pubSockets)
 		_, err := pubSockets[channelID].SendMessage("request", template.Data)
+		sendTime := time.Since(sendStart).Seconds() * 1e6
+		sendTimes = append(sendTimes, sendTime)
+		
+		if debug && sendTime > 100 { // > 100μs send time
+			fmt.Printf("DEBUG [%d]: ZMQ send delay: %.0fμs (channel %d)\n", seqN, sendTime, channelID)
+		}
+		
 		if err != nil {
 			skipped++
 			p.mu.Lock()
 			delete(p.pendingMessages, msgID)
 			p.mu.Unlock()
-			if seqN%100 == 0 {
+			if debug || seqN%100 == 0 {
 				fmt.Printf("ZMQ queue full! Skipped %d/%d messages (%.1f%%)\n", 
 					skipped, seqN, float64(skipped)/float64(seqN)*100)
 			}
@@ -325,26 +348,59 @@ func (p *PubSubProducer) streamMessages(pubSockets []*zmq.Socket, preparedMessag
 			sentCount++
 		}
 		
+		// Sleep timing
 		seqN++
 		nextSendTime = nextSendTime.Add(interval)
 		sleepTime := time.Until(nextSendTime)
+		sleepStart := time.Now()
 		
 		if sleepTime > 0 {
 			time.Sleep(sleepTime)
-		} else if seqN%1000 == 0 {
+			actualSleepTime := time.Since(sleepStart).Seconds() * 1e6
+			sleepTimes = append(sleepTimes, actualSleepTime)
+			
+			if debug && math.Abs(actualSleepTime - sleepTime.Seconds()*1e6) > 100 {
+				fmt.Printf("DEBUG [%d]: Sleep inaccuracy: wanted %.0fμs, got %.0fμs\n", 
+					seqN-1, sleepTime.Seconds()*1e6, actualSleepTime)
+			}
+		} else {
+			sleepTimes = append(sleepTimes, 0)
 			behindMs := -sleepTime.Seconds() * 1000
 			currentRate := float64(sentCount) / time.Since(startTime).Seconds()
-			fmt.Printf("WARNING: %.1fms behind, rate: %.1fHz (target: %.1fHz)\n", 
-				behindMs, currentRate, rateHz)
+			
+			if debug || seqN%1000 == 0 {
+				fmt.Printf("WARNING: %.1fms behind, rate: %.1fHz (target: %.1fHz)\n", 
+					behindMs, currentRate, rateHz)
+			}
+		}
+		
+		// Overall loop timing
+		loopTime := time.Since(loopStart).Seconds() * 1e6
+		if debug && loopTime > 500 { // > 500μs total loop time
+			fmt.Printf("DEBUG [%d]: Slow loop: %.0fμs total (prep:%.0f, mutex:%.0f, send:%.0f)\n", 
+				seqN-1, loopTime, prepTime, mutexTime, sendTime)
+		}
+		
+		// Progress reporting
+		if debug && seqN%1000 == 0 {
+			elapsed := time.Since(startTime).Seconds()
+			rate := float64(sentCount) / elapsed
+			recentDelays := scheduleDelays[max(0, len(scheduleDelays)-1000):]
+			avgDelay := mean(recentDelays)
+			fmt.Printf("PROGRESS [%d]: %.1fs elapsed, %.1f Hz, %.0fμs avg schedule delay\n", 
+				seqN, elapsed, rate, avgDelay)
 		}
 	}
 	
 	return map[string]interface{}{
-		"seq_n":       seqN,
-		"sent_count":  sentCount,
-		"skipped":     skipped,
-		"elapsed_time": time.Since(startTime).Seconds(),
-		"prep_times":   prepTimes,
+		"seq_n":          seqN,
+		"sent_count":     sentCount,
+		"skipped":        skipped,
+		"elapsed_time":   time.Since(startTime).Seconds(),
+		"prep_times":     prepTimes,
+		"send_times":     sendTimes,
+		"sleep_times":    sleepTimes,
+		"schedule_delays": scheduleDelays,
 	}
 }
 
@@ -423,6 +479,62 @@ func (p *PubSubProducer) visualizationListener(vizSocket *zmq.Socket) {
 	}
 }
 
+// waitForResponses waits for all sent messages to receive responses
+func (p *PubSubProducer) waitForResponses(expectedResponses int, debug bool) {
+	if expectedResponses == 0 {
+		return
+	}
+	
+	maxWaitTime := 30 * time.Second // Maximum time to wait
+	checkInterval := 500 * time.Millisecond
+	startWait := time.Now()
+	
+	if debug {
+		fmt.Printf("Waiting for responses: expecting %d messages\n", expectedResponses)
+	}
+	
+	for time.Since(startWait) < maxWaitTime {
+		p.mu.RLock()
+		pendingCount := len(p.pendingMessages)
+		receivedCount := len(p.measurements)
+		p.mu.RUnlock()
+		
+		if debug && time.Since(startWait).Seconds() > 1 { // Report every check after 1s
+			fmt.Printf("Response status: %d received, %d pending (%.1f%% complete)\n", 
+				receivedCount, pendingCount, float64(receivedCount)/float64(expectedResponses)*100)
+		}
+		
+		// Check if we've received responses for all sent messages
+		if receivedCount >= expectedResponses {
+			if debug {
+				fmt.Printf("✅ All %d responses received in %.1fs\n", 
+					receivedCount, time.Since(startWait).Seconds())
+			}
+			return
+		}
+		
+		// Also check if no more pending messages (alternative completion condition)
+		if pendingCount == 0 && receivedCount > 0 {
+			if debug {
+				fmt.Printf("✅ No pending messages, received %d responses in %.1fs\n", 
+					receivedCount, time.Since(startWait).Seconds())
+			}
+			return
+		}
+		
+		time.Sleep(checkInterval)
+	}
+	
+	// Timeout reached
+	p.mu.RLock()
+	finalReceived := len(p.measurements)
+	finalPending := len(p.pendingMessages)
+	p.mu.RUnlock()
+	
+	fmt.Printf("⚠️  Response timeout after %.1fs: %d/%d received (%d still pending)\n", 
+		maxWaitTime.Seconds(), finalReceived, expectedResponses, finalPending)
+}
+
 // analyzeNetworkCSV calls the Python network analysis script
 func (p *PubSubProducer) analyzeNetworkCSV(csvFile string, expectedGbps float64) {
 	cmd := exec.Command("python3", "analyze_netmonitor.py", csvFile, 
@@ -461,10 +573,14 @@ func (p *PubSubProducer) runProducer(rateHz float64, durationSec, msgSize int, i
 	}
 	
 	p.streamingStarted = true
-	results := p.streamMessages(pubSockets, preparedMessages, rateHz, durationSec, msgSize)
+	results := p.streamMessages(pubSockets, preparedMessages, rateHz, durationSec, msgSize, debug)
 	p.analyzePerformance(results, rateHz, msgSize, preparedMessages, debug)
 	
-	time.Sleep(5 * time.Second)
+	// Wait for all responses to arrive
+	sentCount := results["sent_count"].(int)
+	p.waitForResponses(sentCount, debug)
+	
+	time.Sleep(2 * time.Second) // Final buffer
 	monitorProc.Wait()
 	
 	return networkCSV, nil
@@ -501,6 +617,14 @@ func percentile(values []float64, p int) float64 {
 	return sorted[int(index)]
 }
 
+// max returns the maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func main() {
 	// Command line flags
 	rate := flag.Float64("r", 10.0, "Message rate Hz")
@@ -516,6 +640,10 @@ func main() {
 	numChannels := flag.Int("channels", 1, "Number of ZMQ channels")
 	debugFlag := flag.Bool("d", false, "Enable debug output")
 	flag.Parse()
+	
+	if *debugFlag {
+		fmt.Printf("Debug mode enabled - detailed timing and response tracking\n")
+	}
 
 	fmt.Printf("Go Pub-Sub Producer v2.0 - Multi-Channel\n")
 	fmt.Printf("Channels: %d | Rate: %.1f Hz | Duration: %ds | Message Size: %d bytes\n", *numChannels, *rate, *duration, *msgSize)

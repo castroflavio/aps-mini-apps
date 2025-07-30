@@ -32,10 +32,6 @@ def find_stream_boundaries(df, threshold_pct=0.15):
     start_idx = np.argmax(above_threshold)  # First True index
     end_idx = len(above_threshold) - 1 - np.argmax(above_threshold[::-1])  # Last True index
     
-    # Debug info for troubleshooting
-    print(f"DEBUG: Max throughput: {max_throughput:.2f} Gbps, Threshold: {threshold:.3f} Gbps")
-    print(f"DEBUG: Stream boundaries: samples {start_idx} to {end_idx} (of {len(tx_gbps)} total)")
-    
     return start_idx, end_idx
 
 def analyze_network_counters(csv_file, expected_gbps=None):
@@ -94,32 +90,40 @@ def analyze_network_counters(csv_file, expected_gbps=None):
         stream_start_idx, stream_end_idx = find_stream_boundaries(valid_data)
         stream_data = valid_data.iloc[stream_start_idx:stream_end_idx+1] if stream_start_idx is not None else valid_data
         
-        # Overall statistics
-        total_duration = df['elapsed'].iloc[-1]
+        # Calculate durations
+        total_monitoring_duration = df['elapsed'].iloc[-1]
         total_sent_gb = (df['bytes_sent'].iloc[-1] - df['bytes_sent'].iloc[0]) / 1e9
         total_recv_gb = (df['bytes_recv'].iloc[-1] - df['bytes_recv'].iloc[0]) / 1e9
         
-        print(f"\n=== Network Counter Analysis ===")
-        print(f"Duration: {total_duration:.1f}s | Samples: {len(df)}")
-        print(f"Total TX: {total_sent_gb:.2f} GB | Total RX: {total_recv_gb:.2f} GB")
-        
-        # Stream boundary information
+        # Determine which duration and data to report
         if stream_start_idx is not None:
-            # Get actual indices from the valid_data dataframe
+            # Use stream boundaries for primary reporting
             stream_start_time = valid_data.iloc[stream_start_idx]['elapsed']
             stream_end_time = valid_data.iloc[stream_end_idx]['elapsed']
-            stream_duration = stream_end_time - stream_start_time
-            
-            # Calculate bytes transferred during stream period
+            active_duration = stream_end_time - stream_start_time
             stream_sent_gb = (valid_data.iloc[stream_end_idx]['bytes_sent'] - valid_data.iloc[stream_start_idx]['bytes_sent']) / 1e9
+            stream_recv_gb = (valid_data.iloc[stream_end_idx]['bytes_recv'] - valid_data.iloc[stream_start_idx]['bytes_recv']) / 1e9
             
-            # Also show efficiency: active time vs total time
-            efficiency_pct = (stream_duration / total_duration) * 100
+            # Report stream-based statistics as primary
+            print(f"\n=== Network Counter Analysis ===")
+            print(f"Stream Duration: {active_duration:.1f}s | Active Samples: {stream_end_idx - stream_start_idx + 1}")
+            print(f"Stream TX: {stream_sent_gb:.2f} GB | Stream RX: {stream_recv_gb:.2f} GB")
+            print(f"Monitoring: {total_monitoring_duration:.1f}s total ({(active_duration/total_monitoring_duration)*100:.1f}% active)")
             
-            print(f"Stream: {stream_start_time:.1f}s to {stream_end_time:.1f}s ({stream_duration:.1f}s active, {efficiency_pct:.1f}% of total)")
-            print(f"Stream TX: {stream_sent_gb:.2f} GB")
+            # Set primary duration for throughput calculations
+            primary_duration = active_duration
+            primary_sent_gb = stream_sent_gb
+            primary_recv_gb = stream_recv_gb
         else:
-            print("No clear stream boundaries detected (low throughput)")
+            # Fallback to total duration if no stream detected
+            print(f"\n=== Network Counter Analysis ===")
+            print(f"Duration: {total_monitoring_duration:.1f}s | Samples: {len(df)}")
+            print(f"Total TX: {total_sent_gb:.2f} GB | Total RX: {total_recv_gb:.2f} GB")
+            print("No clear stream boundaries detected (using total duration)")
+            
+            primary_duration = total_monitoring_duration
+            primary_sent_gb = total_sent_gb
+            primary_recv_gb = total_recv_gb
         
         # Throughput statistics using stream data
         tx_nonzero = stream_data[stream_data['tx_gbps'] > 0]['tx_gbps']
@@ -135,6 +139,11 @@ def analyze_network_counters(csv_file, expected_gbps=None):
             if expected_gbps:
                 efficiency = (tx_mean / expected_gbps) * 100
                 print(f"TX Efficiency: {efficiency:.1f}% of expected {expected_gbps:.2f} Gbps")
+                
+            # Calculate overall stream throughput for comparison
+            if stream_start_idx is not None:
+                overall_stream_gbps = (primary_sent_gb * 8) / primary_duration
+                print(f"Overall Stream Rate: {overall_stream_gbps:.2f} Gbps over {primary_duration:.1f}s")
         
         if len(rx_nonzero) > 0:
             rx_mean = rx_nonzero.mean()
