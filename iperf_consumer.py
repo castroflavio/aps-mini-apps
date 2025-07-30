@@ -37,6 +37,11 @@ class IperfConsumer:
         # Run iperf client
         result = subprocess.run(cmd, capture_output=True, text=True)
         
+        # Stop monitoring immediately after iperf completes
+        print("Iperf test completed, stopping network monitor...")
+        monitor.terminate()
+        monitor.wait()  # Wait for clean shutdown
+        
         # Give a moment for any buffering
         time.sleep(1)
         
@@ -44,8 +49,6 @@ class IperfConsumer:
         
         self.analyze_results(iperf_result, csv_file, total_size_gb)
         
-        # Cleanup
-        monitor.terminate()
         return iperf_result
     
     def analyze_results(self, result, csv_file, expected_gb):
