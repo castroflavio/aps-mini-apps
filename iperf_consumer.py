@@ -24,14 +24,14 @@ class IperfConsumer:
         
         # Start monitoring
         csv_file = f"network_consumer_{int(time.time())}.csv"
-        monitor = subprocess.Popen(['python3', 'network_throughput_monitor.py', 
+        monitor = subprocess.Popen(['python3', 'netmonitor.py', 
                                    '-i', self.interface, '-d', str(estimated_duration), '-o', csv_file])
         
         # Wait a moment for producer to be ready
         time.sleep(1)
         
         # Build iperf client command
-        cmd = ['iperf3', '-c', self.server_ip, '-p', str(self.port), '-J', '-n', str(total_bytes)]
+        cmd = ['iperf316', '-c', self.server_ip, '-p', str(self.port), '-J', '-n', str(total_bytes)]
         print(f"Running: {' '.join(cmd)}")
         
         # Run iperf client
@@ -71,8 +71,8 @@ class IperfConsumer:
             print(f"Retransmits: {sent['retransmits']}")
         
         # Network analysis using actual throughput
-        rate_hz = int((actual_gbps * 1e9) / (1024 * 8))
-        subprocess.run(['python3', 'analyze_network.py', csv_file, '-r', str(rate_hz), '-s', '1024'])
+        print(f"\n=== Network Interface Analysis ===")
+        subprocess.run(['python3', 'analyze_netmonitor.py', csv_file, '--expected-gbps', str(actual_gbps)])
         
         print(f"Data: {csv_file}")
 
