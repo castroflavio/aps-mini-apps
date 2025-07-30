@@ -32,9 +32,14 @@ class IperfConsumer:
         
         # Build iperf client command
         cmd = ['iperf3', '-c', self.server_ip, '-p', str(self.port), '-J', '-n', str(total_bytes)]
+        print(f"Running: {' '.join(cmd)}")
         
         # Run iperf client
         result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Give a moment for any buffering
+        time.sleep(1)
+        
         iperf_result = json.loads(result.stdout)
         
         self.analyze_results(iperf_result, csv_file, total_size_gb)

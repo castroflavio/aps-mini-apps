@@ -24,9 +24,11 @@ class IperfProducer:
         
         # Start iperf server
         results_file = f"iperf_producer_{int(time.time())}.json"
-        server = subprocess.Popen(['iperf3', '--server', '--bind', self.bind_ip, 
-                                  '--port', str(self.port), '--json', '--one-time', 
-                                  '--logfile', results_file])
+        server_cmd = ['iperf3', '--server', '--bind', self.bind_ip, 
+                     '--port', str(self.port), '--json', '--one-time', 
+                     '--logfile', results_file]
+        print(f"Running: {' '.join(server_cmd)}")
+        server = subprocess.Popen(server_cmd)
         
         print(f"Producer (server): {self.bind_ip}:{self.port}")
         print(f"Expecting {total_size_gb:.1f} GB transfer")
@@ -35,7 +37,10 @@ class IperfProducer:
         
         # Wait for test completion
         server.wait()
-        time.sleep(1)
+        
+        # Give iperf time to write the results file
+        print("Test completed, waiting for results file...")
+        time.sleep(3)
         
         # Read and analyze results
         with open(results_file, 'r') as f:
