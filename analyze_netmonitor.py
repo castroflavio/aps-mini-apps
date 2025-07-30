@@ -32,6 +32,10 @@ def find_stream_boundaries(df, threshold_pct=0.15):
     start_idx = np.argmax(above_threshold)  # First True index
     end_idx = len(above_threshold) - 1 - np.argmax(above_threshold[::-1])  # Last True index
     
+    # Debug info for troubleshooting
+    print(f"DEBUG: Max throughput: {max_throughput:.2f} Gbps, Threshold: {threshold:.3f} Gbps")
+    print(f"DEBUG: Stream boundaries: samples {start_idx} to {end_idx} (of {len(tx_gbps)} total)")
+    
     return start_idx, end_idx
 
 def analyze_network_counters(csv_file, expected_gbps=None):
@@ -101,13 +105,21 @@ def analyze_network_counters(csv_file, expected_gbps=None):
         
         # Stream boundary information
         if stream_start_idx is not None:
+            # Get actual indices from the valid_data dataframe
             stream_start_time = valid_data.iloc[stream_start_idx]['elapsed']
             stream_end_time = valid_data.iloc[stream_end_idx]['elapsed']
             stream_duration = stream_end_time - stream_start_time
+            
+            # Calculate bytes transferred during stream period
             stream_sent_gb = (valid_data.iloc[stream_end_idx]['bytes_sent'] - valid_data.iloc[stream_start_idx]['bytes_sent']) / 1e9
             
-            print(f"Stream: {stream_start_time:.1f}s to {stream_end_time:.1f}s ({stream_duration:.1f}s active)")
+            # Also show efficiency: active time vs total time
+            efficiency_pct = (stream_duration / total_duration) * 100
+            
+            print(f"Stream: {stream_start_time:.1f}s to {stream_end_time:.1f}s ({stream_duration:.1f}s active, {efficiency_pct:.1f}% of total)")
             print(f"Stream TX: {stream_sent_gb:.2f} GB")
+        else:
+            print("No clear stream boundaries detected (low throughput)")
         
         # Throughput statistics using stream data
         tx_nonzero = stream_data[stream_data['tx_gbps'] > 0]['tx_gbps']

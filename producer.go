@@ -358,7 +358,7 @@ func (p *PubSubProducer) analyzePerformance(results map[string]interface{}, rate
 	
 	throughputGbps := float64(sentCount*msgSize*8) / (elapsedTime * 1e9)
 	
-	fmt.Printf("\n=== Process Results ===\n")
+	fmt.Printf("\n=== Producer Results ===\n")
 	fmt.Printf("Messages: %d/%d sent (%d skipped = %.1f%%)\n", 
 		sentCount, seqN, skipped, float64(skipped)/float64(seqN)*100)
 	fmt.Printf("Rate: %.1f Hz (target: %.1f Hz) | Throughput: %.2f Gbps\n", 
@@ -537,7 +537,7 @@ func main() {
 			totalDelays = append(totalDelays, float64(m.TotalDelayMs))
 		}
 
-		fmt.Printf("\n=== Producer Results ===\n")
+		fmt.Printf("\n=== Process Results ===\n")
 		fmt.Printf("Completed: %d measurements\n", len(producer.measurements))
 		fmt.Printf("Offset: %.3fms (P99: %.3fms)\n", mean(offsets), percentile(offsets, 99))
 		fmt.Printf("Delay: %.3fms (P99: %.3fms)\n", mean(delays), percentile(delays, 99))
